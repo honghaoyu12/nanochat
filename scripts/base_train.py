@@ -18,6 +18,7 @@ import json
 import time
 import math
 import argparse
+import csv
 from dataclasses import asdict
 from contextlib import contextmanager
 
@@ -30,11 +31,35 @@ from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, 
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
+from nanochat.controlled_muon import (
+    ABSOLUTE_GROUP_SCALING_MODES,
+    CONTROL_FEEDBACK_SCOPES,
+    NanochatMuonController,
+    absolute_group_lr_scale,
+    control_feedback_state_dict,
+    select_control_feedback,
+    validate_absolute_group_scaling,
+    validate_control_feedback_configuration,
+    validate_resumed_control_feedback,
+)
+from nanochat.control_governors import (
+    AUTONOMOUS_COOLDOWN_VARIANTS,
+    AlphaCeilingGovernor,
+    GovernedMuonController,
+    ValidationProgressDetector,
+)
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
 from nanochat.flash_attention import HAS_FA3
 from scripts.base_eval import evaluate_core
 print_banner()
+
+BASE_CONTROLLED_MUON_VARIANTS = set(NanochatMuonController.VALID_VARIANTS)
+AUTONOMOUS_COOLDOWN_MUON_VARIANTS = set(AUTONOMOUS_COOLDOWN_VARIANTS)
+CONTROLLED_MUON_VARIANTS = sorted(
+    BASE_CONTROLLED_MUON_VARIANTS | AUTONOMOUS_COOLDOWN_MUON_VARIANTS
+)
+OPTIMIZER_VARIANTS = ["native_muon", "torch_muon"] + CONTROLLED_MUON_VARIANTS
 
 # -----------------------------------------------------------------------------
 # CLI arguments
@@ -43,6 +68,7 @@ parser = argparse.ArgumentParser(description="Pretrain base model")
 parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb logging)")
 # Runtime
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
+parser.add_argument("--seed", type=int, default=42, help="global model and CUDA RNG seed")
 # FP8 training
 parser.add_argument("--fp8", action="store_true", help="enable FP8 training (requires H100+ GPU)")
 parser.add_argument("--fp8-recipe", type=str, default="tensorwise", choices=["rowwise", "tensorwise"], help="FP8 scaling recipe: tensorwise (faster, recommended) or rowwise (more accurate but slower)")
@@ -56,6 +82,8 @@ parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding 
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
 parser.add_argument("--target-param-data-ratio", type=float, default=12, help="calculate num_iterations to maintain data:param ratio (Chinchilla=20, -1 = disable)")
+parser.add_argument("--max-runtime-minutes", type=float, default=-1.0, help="gracefully stop after this many wallclock minutes (-1 = disable)")
+parser.add_argument("--stop-after-steps", type=int, default=-1, help="cleanly stop at this optimizer step while keeping num_iterations as the scheduler horizon (-1 = disable)")
 # Optimization
 parser.add_argument("--device-batch-size", type=int, default=32, help="per-device batch size. good number to reduce to 16,8,4,... if you OOM on VRAM.")
 parser.add_argument("--total-batch-size", type=int, default=-1, help="total batch size in tokens. decent numbers are e.g. 524288. (-1 = auto-compute optimal)")
@@ -68,6 +96,66 @@ parser.add_argument("--warmup-steps", type=int, default=40, help="number of step
 parser.add_argument("--warmdown-ratio", type=float, default=0.65, help="ratio of iterations for LR warmdown")
 parser.add_argument("--final-lr-frac", type=float, default=0.05, help="final LR as fraction of initial LR")
 parser.add_argument("--resume-from-step", type=int, default=-1, help="resume training from this step (-1 = disable)")
+# Controlled Muon research baseline
+parser.add_argument("--optimizer-variant", type=str, default="native_muon", choices=OPTIMIZER_VARIANTS, help="optimizer/controller variant")
+parser.add_argument("--controlled-muon", action="store_true", help="enable controlled Muon every-step probe path")
+parser.add_argument("--control-alpha-mode", type=str, default="absolute", choices=["absolute", "multiplier"], help="absolute alpha replaces controlled group lr; multiplier scales native scheduled controlled group lr")
+parser.add_argument("--control-alpha-reference", type=str, default="none", choices=["none", "native_wsd"], help="alpha reference mode; none means alpha is an absolute actuator")
+parser.add_argument("--control-reference-factor-init", type=float, default=1.0, help="initial multiplier for native_wsd ablations")
+parser.add_argument("--control-reference-factor-min", type=float, default=0.8, help="minimum multiplier for native_wsd ablations")
+parser.add_argument("--control-reference-factor-max", type=float, default=1.2, help="maximum multiplier for native_wsd ablations")
+parser.add_argument("--control-start-step", type=int, default=-1, help="first controller probe/update step; -1 uses the alpha warmup boundary")
+parser.add_argument("--control-scope", type=str, default="muon_only", choices=["muon_only", "all_groups"], help="scope for alpha control: Muon matrix groups only, or all optimizer groups")
+parser.add_argument("--control-feedback-scope", type=str, default="total", choices=sorted(CONTROL_FEEDBACK_SCOPES), help="feedback observation used by the alpha controller")
+parser.add_argument("--control-absolute-group-scaling", type=str, default="uniform", choices=sorted(ABSOLUTE_GROUP_SCALING_MODES), help="uniform assigns alpha directly; initial_lr_ratio preserves native group LR ratios around Muon alpha")
+parser.add_argument("--control-period-steps", type=int, default=1, help="controller probe period; use 1 for every-step baseline")
+parser.add_argument("--control-probe-scope", type=str, default="full_accum_batch", choices=["full_accum_batch", "last_microbatch"], help="tokens used for before/after probe loss")
+parser.add_argument("--control-alpha-warmup-steps", type=int, default=0, help="linearly warm up applied absolute alpha over this many steps")
+parser.add_argument("--control-alpha-init", type=float, default=-1.0, help="initial alpha; -1 uses matrix_lr after batch scaling")
+parser.add_argument("--control-alpha-min", type=float, default=-1.0, help="minimum alpha; -1 uses 0.25 * alpha_init")
+parser.add_argument("--control-alpha-max", type=float, default=-1.0, help="maximum alpha; -1 uses 2.0 * alpha_init")
+parser.add_argument("--control-alpha-replay-file", type=str, default="", help="reserved absolute alpha replay source")
+parser.add_argument("--control-rho-star", type=float, default=0.7, help="target rho")
+parser.add_argument("--control-kp", type=float, default=1.0, help="P-controller gain")
+parser.add_argument("--control-ki", type=float, default=0.0, help="I-controller gain for PI/PID variants; must be >0 for PI/PID")
+parser.add_argument("--control-kd", type=float, default=0.0, help="D-controller gain for PID variants; must be >0 for PID")
+parser.add_argument("--control-rho-beta", type=float, default=0.9, help="rho EMA beta")
+parser.add_argument("--control-integral-beta", type=float, default=0.95, help="EMA decay for PI/PID integral state")
+parser.add_argument("--control-integral-clip", type=float, default=10.0, help="absolute clamp for PI/PID integral state")
+parser.add_argument("--control-derivative-beta", type=float, default=0.0, help="EMA decay for PID derivative state")
+parser.add_argument("--control-factor-min", type=float, default=0.9, help="minimum per-step alpha factor")
+parser.add_argument("--control-factor-max", type=float, default=1.1, help="maximum per-step alpha factor")
+parser.add_argument("--control-rho-clip-min", type=float, default=-1.0, help="minimum clipped rho for controller")
+parser.add_argument("--control-rho-clip-max", type=float, default=3.0, help="maximum clipped rho for controller")
+parser.add_argument("--control-trust-rho-threshold", type=float, default=0.9, help="rho threshold for trust-region expansion")
+parser.add_argument("--control-trust-alpha-threshold", type=float, default=1e-4, help="alpha threshold for trust-region expansion")
+parser.add_argument("--control-trust-expand-factor", type=float, default=1.5, help="trust-region expansion factor")
+parser.add_argument("--control-trust-max-factor", type=float, default=1.5, help="hard maximum factor when trust expansion is active")
+parser.add_argument("--control-trust-patience", type=int, default=2, help="good-rho count before trust-region expansion")
+parser.add_argument("--control-alignment-aware", action="store_true", help="apply alignment-aware safety to the selected P/PI/PID controller")
+parser.add_argument("--control-alignment-c-min", type=float, default=0.02, help="minimum alignment for trust-region expansion")
+parser.add_argument("--control-alignment-c-bad", type=float, default=-0.01, help="alignment below this threshold triggers bad-step shrinkage")
+parser.add_argument("--control-alignment-penalty", type=float, default=0.10, help="log-alpha penalty per unit below c-min")
+parser.add_argument("--control-alignment-bad-step-shrink", type=float, default=0.5, help="next-alpha factor for invalid or strongly bad aligned steps")
+parser.add_argument("--control-alignment-max-log-alpha-change", type=float, default=0.05, help="absolute log-alpha change bound for valid alignment-aware updates")
+parser.add_argument("--control-alignment-eps", type=float, default=1e-12, help="alignment denominator epsilon")
+parser.add_argument("--control-reject-bad-steps", action="store_true", help="reserved; not supported in first nanochat implementation")
+parser.add_argument("--control-log-every", type=int, default=1, help="write controller CSV rows every N controller updates")
+parser.add_argument("--control-output-dir", type=str, default="", help="directory for local controlled optimizer metrics")
+parser.add_argument("--local-output-dir", type=str, default="", help="directory for local train/eval metrics for any optimizer variant")
+parser.add_argument("--control-cooldown-window-evals", type=int, default=5, help="validation observations in the robust cooldown progress window")
+parser.add_argument("--control-cooldown-patience-windows", type=int, default=2, help="consecutive low-progress windows required for cooldown")
+parser.add_argument("--control-cooldown-min-relative-progress-per-billion", type=float, default=0.05, help="diminishing-progress threshold as relative validation-BPB improvement per billion tokens")
+parser.add_argument("--control-cooldown-event-log-reduction", type=float, default=math.log(2.0), help="finite log alpha-cap reduction per confirmed cooldown event")
+parser.add_argument("--control-cooldown-transition-steps", type=int, default=200, help="optimization steps used to reach each new alpha cap")
+parser.add_argument("--control-cooldown-holdoff-evals", type=int, default=2, help="validation observations ignored after a cap transition")
+parser.add_argument("--control-cooldown-min-cap-ratio", type=float, default=0.10, help="minimum cap relative to initial controller alpha")
+parser.add_argument("--control-cooldown-max-events", type=int, default=3, help="maximum autonomous cooldown events")
+parser.add_argument("--local-log-every", type=int, default=1, help="write train CSV rows every N optimization steps")
+parser.add_argument("--component-timing-mode", type=str, default="off", choices=["off", "cuda_events", "synchronized"], help="accepted for experiment configs; detailed component timing is disabled in this local patch")
+parser.add_argument("--timing-warmup-steps", type=int, default=10, help="component timing warmup steps")
+parser.add_argument("--timing-probe-warmup-count", type=int, default=1, help="component timing probe warmup count")
+parser.add_argument("--timing-log-every", type=int, default=1, help="component timing log period")
 # Evaluation
 parser.add_argument("--eval-every", type=int, default=250, help="evaluate val bpb every N steps (-1 = disable)")
 parser.add_argument("--eval-tokens", type=int, default=80*524288, help="number of tokens to evaluate val loss on")
@@ -75,16 +163,83 @@ parser.add_argument("--core-metric-every", type=int, default=2000, help="evaluat
 parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="examples per task for CORE metric")
 parser.add_argument("--sample-every", type=int, default=2000, help="sample from model every N steps (-1 = disable)")
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
+parser.add_argument("--skip-final-checkpoint", action="store_true", help="skip the final checkpoint for disposable benchmark jobs")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 args = parser.parse_args()
+autonomous_cooldown_enabled = args.optimizer_variant in AUTONOMOUS_COOLDOWN_MUON_VARIANTS
+cooldown_defaults = {
+    "control_cooldown_window_evals": 5,
+    "control_cooldown_patience_windows": 2,
+    "control_cooldown_min_relative_progress_per_billion": 0.05,
+    "control_cooldown_event_log_reduction": math.log(2.0),
+    "control_cooldown_transition_steps": 200,
+    "control_cooldown_holdoff_evals": 2,
+    "control_cooldown_min_cap_ratio": 0.10,
+    "control_cooldown_max_events": 3,
+}
+if not autonomous_cooldown_enabled:
+    changed_cooldown_args = [
+        name for name, default in cooldown_defaults.items()
+        if getattr(args, name) != default
+    ]
+    if changed_cooldown_args:
+        raise ValueError("cooldown flags require an _autocooldown optimizer variant")
+if args.control_reject_bad_steps:
+    raise ValueError("--control-reject-bad-steps is reserved for a later transactional implementation")
+if args.optimizer_variant in CONTROLLED_MUON_VARIANTS and not args.controlled_muon:
+    args.controlled_muon = True
+if args.controlled_muon and args.optimizer_variant not in CONTROLLED_MUON_VARIANTS:
+    raise ValueError("--controlled-muon requires a controlled_muon_* optimizer variant")
+if args.control_alignment_aware and args.optimizer_variant not in CONTROLLED_MUON_VARIANTS:
+    raise ValueError("--control-alignment-aware requires a controlled P/PI/PID Muon variant")
+if args.seed < 0:
+    raise ValueError("--seed must be non-negative")
+validate_absolute_group_scaling(
+    mode=args.control_absolute_group_scaling,
+    controlled=args.optimizer_variant in CONTROLLED_MUON_VARIANTS,
+    control_scope=args.control_scope,
+    alpha_mode=args.control_alpha_mode,
+    alpha_reference=args.control_alpha_reference,
+)
+if args.control_alpha_reference != "none":
+    raise ValueError("--control-alpha-reference=native_wsd is not enabled for the direct absolute-alpha launch path")
+validate_control_feedback_configuration(
+    scope=args.control_feedback_scope,
+    controlled=args.optimizer_variant in CONTROLLED_MUON_VARIANTS,
+    control_scope=args.control_scope,
+)
+if args.control_alpha_replay_file:
+    raise ValueError("--control-alpha-replay-file is reserved and not enabled for this launch path")
+if args.control_period_steps <= 0:
+    raise ValueError("--control-period-steps must be positive")
+if args.control_log_every <= 0:
+    raise ValueError("--control-log-every must be positive")
+if args.local_log_every <= 0:
+    raise ValueError("--local-log-every must be positive")
+if args.control_alpha_warmup_steps < 0:
+    raise ValueError("--control-alpha-warmup-steps must be non-negative")
+if args.control_start_step < -1:
+    raise ValueError("--control-start-step must be -1 or non-negative")
+if args.control_start_step == -1:
+    args.control_start_step = args.control_alpha_warmup_steps if args.control_alpha_mode == "absolute" else 0
+if args.timing_warmup_steps < 0 or args.timing_probe_warmup_count < 0:
+    raise ValueError("timing warmup counts must be non-negative")
+if args.timing_log_every <= 0:
+    raise ValueError("--timing-log-every must be positive")
+if autonomous_cooldown_enabled and args.eval_every <= 0:
+    raise ValueError("autonomous cooldown requires --eval-every > 0")
+if autonomous_cooldown_enabled and args.eval_tokens <= 0:
+    raise ValueError("autonomous cooldown requires --eval-tokens > 0")
 user_config = vars(args).copy()  # for logging
 # -----------------------------------------------------------------------------
 # Compute init and wandb logging
 
 device_type = autodetect_device_type() if args.device_type == "" else args.device_type
-ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
+ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type, seed=args.seed)
 master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
+if args.optimizer_variant == "torch_muon" and ddp_world_size > 1:
+    raise ValueError("torch_muon reference baseline is single-rank only; run one process per GPU instead of torchrun")
 synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
 get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else lambda: 0
 if device_type == "cuda":
@@ -98,6 +253,44 @@ print0(f"COMPUTE_DTYPE: {COMPUTE_DTYPE} ({COMPUTE_DTYPE_REASON})")
 # wandb logging init
 use_dummy_wandb = args.run == "dummy" or not master_process
 wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", name=args.run, config=user_config)
+
+# Project-local metrics for controlled-optimizer experiments.
+def _csv_writer(path, fieldnames):
+    if not master_process:
+        return None, None
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    exists = os.path.exists(path)
+    f = open(path, "a", newline="", encoding="utf-8")
+    writer = csv.DictWriter(f, fieldnames=fieldnames)
+    if not exists:
+        writer.writeheader()
+        f.flush()
+    return f, writer
+
+def _write_csv_row(writer, file_handle, row):
+    if writer is None:
+        return
+    writer.writerow(row)
+    file_handle.flush()
+
+def _all_reduce_mean_scalar(value: float, device: torch.device) -> float:
+    tensor = torch.tensor(float(value), dtype=torch.float64, device=device)
+    if is_ddp_initialized():
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        tensor /= dist.get_world_size()
+    return float(tensor.item())
+
+def _average_probe_loss(model, probe_batches):
+    loss_sum = 0.0
+    count = 0
+    with torch.no_grad():
+        for xb, yb in probe_batches:
+            loss = model(xb, yb)
+            loss_sum += float(loss.detach().item())
+            count += 1
+    if count == 0:
+        raise RuntimeError("probe loss requested with no stored probe batches")
+    return loss_sum / count
 
 # Flash Attention status
 from nanochat.flash_attention import USE_FA3
@@ -305,6 +498,7 @@ if weight_decay_scaled != args.weight_decay:
 
 # -----------------------------------------------------------------------------
 # Initialize the Optimizer (combined MuonAdamW: Muon for matrix params, AdamW for rest)
+optimizer_backend = "torch_muon" if args.optimizer_variant == "torch_muon" else "native"
 optimizer = model.setup_optimizer(
     # AdamW hyperparameters
     unembedding_lr=args.unembedding_lr * batch_lr_scale,
@@ -313,11 +507,216 @@ optimizer = model.setup_optimizer(
     # Muon hyperparameters
     matrix_lr=args.matrix_lr * batch_lr_scale,
     weight_decay=weight_decay_scaled,
+    backend=optimizer_backend,
 )
 
 if resuming:
     optimizer.load_state_dict(optimizer_data)
     del optimizer_data
+
+controlled_muon_enabled = args.optimizer_variant in CONTROLLED_MUON_VARIANTS
+muon_initial_lrs = [float(group["initial_lr"]) for group in optimizer.param_groups if group["kind"] == "muon"]
+native_muon_reference_peak_lr = max(muon_initial_lrs) if muon_initial_lrs else float(args.matrix_lr * batch_lr_scale)
+scaled_absolute_all_groups_enabled = (
+    controlled_muon_enabled
+    and args.control_scope == "all_groups"
+    and args.control_alpha_mode == "absolute"
+    and args.control_alpha_reference == "none"
+    and args.control_absolute_group_scaling == "initial_lr_ratio"
+)
+for group in optimizer.param_groups:
+    group["control_absolute_lr_scale"] = absolute_group_lr_scale(
+        mode=args.control_absolute_group_scaling,
+        initial_lr=float(group["initial_lr"]),
+        anchor_lr=native_muon_reference_peak_lr,
+    )
+controller = None
+control_output_dir = args.control_output_dir
+if controlled_muon_enabled:
+    if args.control_alpha_init > 0:
+        alpha_init = args.control_alpha_init
+    elif args.control_alpha_mode == "multiplier":
+        alpha_init = 1.0
+    else:
+        alpha_init = args.matrix_lr * batch_lr_scale
+    alpha_min = args.control_alpha_min if args.control_alpha_min > 0 else 0.25 * alpha_init
+    alpha_max = args.control_alpha_max if args.control_alpha_max > 0 else 2.0 * alpha_init
+    base_controller_variant = AUTONOMOUS_COOLDOWN_VARIANTS.get(args.optimizer_variant, args.optimizer_variant)
+    base_controller = NanochatMuonController(
+        variant=base_controller_variant,
+        alpha_init=alpha_init,
+        alpha_min=alpha_min,
+        alpha_max=alpha_max,
+        rho_star=args.control_rho_star,
+        kp=args.control_kp,
+        ki=args.control_ki,
+        kd=args.control_kd,
+        rho_beta=args.control_rho_beta,
+        integral_beta=args.control_integral_beta,
+        integral_clip=args.control_integral_clip,
+        derivative_beta=args.control_derivative_beta,
+        factor_min=args.control_factor_min,
+        factor_max=args.control_factor_max,
+        rho_clip_min=args.control_rho_clip_min,
+        rho_clip_max=args.control_rho_clip_max,
+        trust_region_rho_threshold=args.control_trust_rho_threshold,
+        trust_region_alpha_threshold=args.control_trust_alpha_threshold,
+        trust_region_expand_factor=args.control_trust_expand_factor,
+        trust_region_max_factor=args.control_trust_max_factor,
+        trust_region_patience=args.control_trust_patience,
+        alignment_aware=args.control_alignment_aware,
+        alignment_c_min=args.control_alignment_c_min,
+        alignment_c_bad=args.control_alignment_c_bad,
+        alignment_penalty=args.control_alignment_penalty,
+        alignment_bad_step_shrink=args.control_alignment_bad_step_shrink,
+        alignment_max_log_alpha_change=args.control_alignment_max_log_alpha_change,
+        alignment_eps=args.control_alignment_eps,
+    )
+    if not control_output_dir:
+        control_output_dir = os.path.join(base_dir, "controlled_optimizer_outputs", output_dirname, args.optimizer_variant)
+    if autonomous_cooldown_enabled:
+        cooldown_detector = ValidationProgressDetector(
+            window_evals=args.control_cooldown_window_evals,
+            patience_windows=args.control_cooldown_patience_windows,
+            min_relative_progress_per_billion=args.control_cooldown_min_relative_progress_per_billion,
+        )
+        cooldown_governor = AlphaCeilingGovernor(
+            reference_alpha=alpha_init,
+            alpha_min=alpha_min,
+            alpha_max=alpha_max,
+            detector=cooldown_detector,
+            event_log_reduction=args.control_cooldown_event_log_reduction,
+            transition_steps=args.control_cooldown_transition_steps,
+            holdoff_evals=args.control_cooldown_holdoff_evals,
+            minimum_cap_ratio=args.control_cooldown_min_cap_ratio,
+            maximum_events=args.control_cooldown_max_events,
+        )
+        controller = GovernedMuonController(
+            variant=args.optimizer_variant,
+            base_controller=base_controller,
+            governor=cooldown_governor,
+        )
+    else:
+        controller = base_controller
+    if resuming:
+        controller_state = meta_data.get("loop_state", {}).get("controlled_muon_controller")
+        if controller_state is not None:
+            controller.load_state_dict(controller_state)
+        validate_resumed_control_feedback(
+            configured_scope=args.control_feedback_scope,
+            saved_state=meta_data.get("loop_state", {}).get(
+                "controlled_muon_feedback"
+            ),
+        )
+
+metrics_output_dir = args.local_output_dir
+if controlled_muon_enabled and not metrics_output_dir:
+    metrics_output_dir = control_output_dir
+local_metrics_enabled = bool(metrics_output_dir)
+if local_metrics_enabled and master_process:
+    os.makedirs(metrics_output_dir, exist_ok=True)
+
+if local_metrics_enabled and master_process:
+    metadata_path = os.path.join(metrics_output_dir, "run_metadata.json")
+    metadata = {
+        "nanochat_commit": "92d63d4e8bb4df75c3b71618f31ddde2378b2bcd",
+        "optimizer_variant": args.optimizer_variant,
+        "optimizer_backend": optimizer_backend,
+        "controlled_muon_enabled": controlled_muon_enabled,
+        "control_output_dir": control_output_dir,
+        "local_output_dir": metrics_output_dir,
+        "user_config": user_config,
+        "model_config": model_config_kwargs,
+        "param_counts": param_counts,
+        "batch_lr_scale": batch_lr_scale,
+        "weight_decay_scaled": weight_decay_scaled,
+        "controller": None if controller is None else controller.state_dict(),
+        "control_alpha_reference": args.control_alpha_reference,
+        "control_absolute_group_scaling": args.control_absolute_group_scaling,
+        "native_muon_reference_peak_lr": native_muon_reference_peak_lr,
+        "scaled_absolute_all_groups_enabled": scaled_absolute_all_groups_enabled,
+        "control_feedback": control_feedback_state_dict(args.control_feedback_scope),
+    }
+    with open(metadata_path, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2)
+
+if controlled_muon_enabled and master_process:
+    os.makedirs(control_output_dir, exist_ok=True)
+
+controller_csv_fields = [
+    "step", "tokens", "alpha", "alpha_next", "alpha_update_factor", "alpha_mode",
+    "control_scope", "feedback_scope",
+    "native_lrm", "native_muon_lr_min", "native_muon_lr_max", "muon_lr_min",
+    "muon_lr_max", "adamw_lr_min", "adamw_lr_max",
+    "effective_muon_lr_min", "effective_muon_lr_max",
+    "effective_muon_lr_mean", "rho", "rho_clipped", "rho_ema", "rho_control",
+    "loss_before_probe", "loss_after_probe", "actual_decrease",
+    "feedback_actual_decrease", "feedback_predicted_decrease",
+    "rho_total", "rho_muon_residual_proxy", "adamw_predicted_fraction",
+    "predicted_decrease_total", "predicted_decrease_muon", "predicted_decrease_adamw",
+    "predicted_decrease_safe", "control_error", "p_term", "i_term", "d_term",
+    "control_log_factor", "integral_state", "derivative_state",
+    "muon_update_norm", "adamw_update_norm", "total_update_norm", "muon_grad_norm",
+    "adamw_grad_norm", "total_grad_norm", "num_muon_params", "num_adamw_params",
+    "num_muon_tensors", "num_adamw_tensors", "factor_applied",
+    "trust_region_expanded", "trust_good_count", "probe_scope", "probe_num_microbatches",
+    "alignment_c", "alignment_penalty_term", "alignment_allows_trust_expansion",
+    "alignment_bad_step", "integral_accumulation_frozen",
+    "cooldown_alpha_proposed", "cooldown_alpha_cap_target",
+    "cooldown_alpha_cap", "cooldown_alpha_applied",
+    "cooldown_cap_is_binding", "cooldown_governor_state",
+    "cooldown_event_count",
+    "predicted_was_floored", "rho_was_clipped", "skipped_reason", "dt_seconds",
+]
+train_csv_fields = [
+    "step", "tokens", "train_loss", "smooth_train_loss", "lrm", "dt_seconds",
+    "tok_per_sec", "mfu", "total_training_time_seconds", "alpha",
+    "native_muon_lr_min", "native_muon_lr_max", "muon_lr_min", "muon_lr_max",
+    "muon_lr_mean", "effective_muon_lr_mean",
+]
+eval_csv_fields = [
+    "step", "tokens", "val_bpb", "min_val_bpb", "eval_steps", "eval_tokens",
+    "total_training_time_seconds", "wallclock_time_seconds",
+]
+cooldown_csv_fields = [
+    "step", "tokens", "val_bpb", "window_progress_per_billion",
+    "plateau_threshold", "plateau_candidate", "plateau_streak",
+    "plateau_confirmed", "window_observations", "governor_state",
+    "holdoff_evals_remaining", "cooldown_event", "cooldown_event_count",
+    "alpha_proposed", "alpha_cap_target", "alpha_cap", "alpha_applied",
+    "cap_is_binding",
+]
+controller_csv_file, controller_csv_writer = (None, None)
+train_csv_file, train_csv_writer = (None, None)
+eval_csv_file, eval_csv_writer = (None, None)
+cooldown_csv_file, cooldown_csv_writer = (None, None)
+if controlled_muon_enabled:
+    controller_csv_file, controller_csv_writer = _csv_writer(os.path.join(control_output_dir, "controller_metrics.csv"), controller_csv_fields)
+if autonomous_cooldown_enabled:
+    cooldown_csv_file, cooldown_csv_writer = _csv_writer(os.path.join(control_output_dir, "cooldown_metrics.csv"), cooldown_csv_fields)
+if local_metrics_enabled:
+    train_csv_file, train_csv_writer = _csv_writer(os.path.join(metrics_output_dir, "train_metrics.csv"), train_csv_fields)
+    eval_csv_file, eval_csv_writer = _csv_writer(os.path.join(metrics_output_dir, "eval_metrics.csv"), eval_csv_fields)
+    if master_process:
+        group_summary = []
+        for group_idx, group in enumerate(optimizer.param_groups):
+            params = group["params"]
+            num_params = sum(p.numel() for p in params)
+            shapes = {}
+            for p in params:
+                key = "x".join(str(dim) for dim in p.shape)
+                shapes[key] = shapes.get(key, 0) + 1
+            group_summary.append({
+                "group_idx": group_idx,
+                "kind": group["kind"],
+                "initial_lr": group["initial_lr"],
+                "control_absolute_lr_scale": group.get("control_absolute_lr_scale"),
+                "num_tensors": len(params),
+                "num_params": num_params,
+                "shapes": shapes,
+            })
+        with open(os.path.join(metrics_output_dir, "optimizer_group_summary.json"), "w", encoding="utf-8") as f:
+            json.dump(group_summary, f, indent=2)
 
 # -----------------------------------------------------------------------------
 # GradScaler for fp16 training (bf16/fp32 don't need it — bf16 has the same exponent range as fp32)
@@ -351,9 +750,20 @@ elif args.target_param_data_ratio > 0:
     print0(f"Calculated number of iterations from target data:param ratio: {num_iterations:,}")
 else:
     raise ValueError("No training horizon specified")
-total_tokens = total_batch_size * num_iterations # the actual number of tokens we will train for
-print0(f"Total number of training tokens: {total_tokens:,}")
-print0(f"Tokens : Scaling params ratio: {total_batch_size * num_iterations / num_scaling_params:.2f}") # e.g. Chinchilla was ~20
+
+if args.stop_after_steps > 0:
+    if args.stop_after_steps > num_iterations:
+        raise ValueError("--stop-after-steps must be <= --num-iterations / computed scheduler horizon")
+    stop_step = args.stop_after_steps
+    print0(f"Will stop after {stop_step:,} optimizer steps while using {num_iterations:,} as scheduler horizon")
+else:
+    stop_step = num_iterations
+
+schedule_total_tokens = total_batch_size * num_iterations
+total_tokens = total_batch_size * stop_step # the actual number of tokens we will train for
+print0(f"Scheduler horizon tokens: {schedule_total_tokens:,}")
+print0(f"Planned training tokens: {total_tokens:,}")
+print0(f"Tokens : Scaling params ratio: {total_tokens / num_scaling_params:.2f}") # e.g. Chinchilla was ~20
 print0(f"Total training FLOPs estimate: {num_flops_per_token * total_tokens:e}")
 
 # Learning rate schedule (linear warmup, constant, linear warmdown)
@@ -385,6 +795,15 @@ def get_muon_momentum(it):
 def get_weight_decay(it):
     return weight_decay_scaled * 0.5 * (1 + math.cos(math.pi * it / num_iterations))
 
+def get_control_alpha_warmup_multiplier(it):
+    if (
+        not controlled_muon_enabled
+        or args.control_alpha_mode != "absolute"
+        or args.control_alpha_warmup_steps <= 0
+    ):
+        return 1.0
+    return min(1.0, (it + 1) / args.control_alpha_warmup_steps)
+
 # -----------------------------------------------------------------------------
 # Training loop
 
@@ -413,8 +832,21 @@ print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
 
 # Go!
+run_wallclock_start = time.time()
+runtime_stop_announced = False
 while True:
-    last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
+    runtime_limit_reached = (
+        args.max_runtime_minutes > 0
+        and step > 0
+        and (time.time() - run_wallclock_start) >= args.max_runtime_minutes * 60.0
+    )
+    if runtime_limit_reached and not runtime_stop_announced:
+        print0(
+            f"Stopping because max runtime {args.max_runtime_minutes:.2f} minutes "
+            f"was reached at step {step:,}"
+        )
+        runtime_stop_announced = True
+    last_step = step == stop_step or runtime_limit_reached # loop runs stop_step+1 times so that we can eval/save at the end
     flops_so_far = num_flops_per_token * total_batch_size * step
 
     # once in a while: evaluate the val bpb (all ranks participate)
@@ -422,6 +854,8 @@ while True:
         model.eval()
         val_loader = build_val_loader()
         eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
+        if autonomous_cooldown_enabled and eval_steps < 1:
+            raise ValueError("autonomous cooldown requires --eval-tokens to cover at least one distributed evaluation batch")
         with disable_fp8(model):
             val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.6f}")
@@ -433,6 +867,61 @@ while True:
             "total_training_time": total_training_time,
             "val/bpb": val_bpb,
         })
+        _write_csv_row(eval_csv_writer, eval_csv_file, {
+            "step": step,
+            "tokens": total_batch_size * step,
+            "val_bpb": val_bpb,
+            "min_val_bpb": min_val_bpb,
+            "eval_steps": eval_steps,
+            "eval_tokens": args.eval_tokens,
+            "total_training_time_seconds": total_training_time,
+            "wallclock_time_seconds": time.time() - run_wallclock_start,
+        })
+        if autonomous_cooldown_enabled:
+            cooldown_stats = None
+            duplicate_resume_validation = False
+            if master_process:
+                duplicate_resume_validation = (
+                    controller.governor.last_validation_step == step
+                )
+                if duplicate_resume_validation:
+                    cooldown_stats = controller.governor.last_validation_stats
+                else:
+                    cooldown_stats = controller.observe_validation(
+                        step=step,
+                        tokens=total_batch_size * step,
+                        val_bpb=val_bpb,
+                        allow_event=not last_step,
+                    )
+            if is_ddp_initialized():
+                cooldown_state_payload = [
+                    controller.state_dict() if master_process else None
+                ]
+                dist.broadcast_object_list(cooldown_state_payload, src=0)
+                if not master_process:
+                    controller.load_state_dict(cooldown_state_payload[0])
+                    cooldown_stats = controller.governor.last_validation_stats
+            if master_process and not duplicate_resume_validation:
+                _write_csv_row(cooldown_csv_writer, cooldown_csv_file, {
+                    "step": cooldown_stats.step,
+                    "tokens": cooldown_stats.tokens,
+                    "val_bpb": cooldown_stats.val_bpb,
+                    "window_progress_per_billion": cooldown_stats.window_progress_per_billion,
+                    "plateau_threshold": args.control_cooldown_min_relative_progress_per_billion,
+                    "plateau_candidate": int(cooldown_stats.plateau_candidate),
+                    "plateau_streak": cooldown_stats.plateau_streak,
+                    "plateau_confirmed": int(cooldown_stats.plateau_confirmed),
+                    "window_observations": cooldown_stats.window_observations,
+                    "governor_state": cooldown_stats.governor_state,
+                    "holdoff_evals_remaining": cooldown_stats.holdoff_evals_remaining,
+                    "cooldown_event": int(cooldown_stats.cooldown_event),
+                    "cooldown_event_count": cooldown_stats.cooldown_event_count,
+                    "alpha_proposed": cooldown_stats.alpha_proposed,
+                    "alpha_cap_target": cooldown_stats.alpha_cap_target,
+                    "alpha_cap": cooldown_stats.alpha_cap,
+                    "alpha_applied": cooldown_stats.alpha_applied,
+                    "cap_is_binding": int(cooldown_stats.cap_is_binding),
+                })
         model.train()
 
     # once in a while: estimate the CORE metric (all ranks participate)
@@ -474,7 +963,7 @@ while True:
         model.train()
 
     # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step
-    if last_step or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0):
+    if (last_step and not args.skip_final_checkpoint) or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0):
         save_checkpoint(
             checkpoint_dir,
             step,
@@ -493,6 +982,8 @@ while True:
                     "min_val_bpb": min_val_bpb,
                     "smooth_train_loss": smooth_train_loss,
                     "total_training_time": total_training_time,
+                    "controlled_muon_controller": None if controller is None else controller.state_dict(),
+                    "controlled_muon_feedback": None if controller is None else control_feedback_state_dict(args.control_feedback_scope),
                 },
             },
             rank=ddp_rank,
@@ -507,9 +998,26 @@ while True:
     # evaluate the gradient
     synchronize()
     t0 = time.time()
+    control_active = controlled_muon_enabled and step >= args.control_start_step
+    probe_this_step = control_active and ((step - args.control_start_step) % args.control_period_steps == 0)
+    probe_batches = []
+    loss_before_probe_sum = 0.0
+    loss_before_probe_count = 0
+    control_stats = None
+    control_diagnostics = None
+    control_feedback = None
     for micro_step in range(grad_accum_steps):
         loss = model(x, y)
         train_loss = loss.detach() # for logging
+        if probe_this_step:
+            if args.control_probe_scope == "full_accum_batch":
+                probe_batches.append((x.detach().clone(), y.detach().clone()))
+                loss_before_probe_sum += float(loss.detach().item())
+                loss_before_probe_count += 1
+            elif args.control_probe_scope == "last_microbatch" and micro_step == grad_accum_steps - 1:
+                probe_batches = [(x.detach().clone(), y.detach().clone())]
+                loss_before_probe_sum = float(loss.detach().item())
+                loss_before_probe_count = 1
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         if scaler is not None:
             scaler.scale(loss).backward()
@@ -520,51 +1028,240 @@ while True:
     lrm = get_lr_multiplier(step)
     muon_momentum = get_muon_momentum(step)
     muon_weight_decay = get_weight_decay(step)
+    if autonomous_cooldown_enabled:
+        controller.prepare_step(step)
+    control_alpha_warmup_multiplier = get_control_alpha_warmup_multiplier(step)
+    control_alpha_applied = (
+        controller.alpha * control_alpha_warmup_multiplier
+        if controlled_muon_enabled and controller is not None
+        else None
+    )
+    native_muon_lr_values = []
+    muon_lr_values = []
+    adamw_lr_values = []
+    effective_muon_lr_values = []
     for group in optimizer.param_groups:
-        group["lr"] = group["initial_lr"] * lrm
-        if group['kind'] == 'muon':
+        base_lr = group["initial_lr"] * lrm
+        group["lr"] = base_lr
+        if controlled_muon_enabled and args.control_scope == "all_groups":
+            if args.control_alpha_mode == "absolute":
+                scale = group.get("control_absolute_lr_scale", 1.0) if scaled_absolute_all_groups_enabled else 1.0
+                group["lr"] = control_alpha_applied * scale
+            elif args.control_alpha_mode == "multiplier":
+                group["lr"] = base_lr * controller.alpha
+            else:
+                raise ValueError(f"unknown control alpha mode: {args.control_alpha_mode}")
+        if group["kind"] == "muon":
+            native_muon_lr_values.append(float(base_lr))
+            if controlled_muon_enabled and args.control_scope == "muon_only":
+                if args.control_alpha_mode == "absolute":
+                    group["lr"] = control_alpha_applied
+                elif args.control_alpha_mode == "multiplier":
+                    group["lr"] = base_lr * controller.alpha
+                else:
+                    raise ValueError(f"unknown control alpha mode: {args.control_alpha_mode}")
             group["momentum"] = muon_momentum
             group["weight_decay"] = muon_weight_decay
+            shape = group["params"][0].shape
+            shape_scale = max(1.0, shape[-2] / shape[-1])**0.5
+            muon_lr_values.append(float(group["lr"]))
+            effective_muon_lr_values.append(float(group["lr"] * shape_scale))
+        elif group["kind"] == "adamw":
+            adamw_lr_values.append(float(group["lr"]))
+    native_muon_lr_min = min(native_muon_lr_values) if native_muon_lr_values else ""
+    native_muon_lr_max = max(native_muon_lr_values) if native_muon_lr_values else ""
+    muon_lr_min = min(muon_lr_values) if muon_lr_values else ""
+    muon_lr_max = max(muon_lr_values) if muon_lr_values else ""
+    muon_lr_mean = sum(muon_lr_values) / len(muon_lr_values) if muon_lr_values else ""
+    adamw_lr_min = min(adamw_lr_values) if adamw_lr_values else ""
+    adamw_lr_max = max(adamw_lr_values) if adamw_lr_values else ""
+    effective_muon_lr_min = min(effective_muon_lr_values) if effective_muon_lr_values else ""
+    effective_muon_lr_max = max(effective_muon_lr_values) if effective_muon_lr_values else ""
+    effective_muon_lr_mean = sum(effective_muon_lr_values) / len(effective_muon_lr_values) if effective_muon_lr_values else ""
+    if probe_this_step:
+        optimizer.set_control_diagnostics(True, include_adamw=True)
+    step_skipped_by_scaler = False
     if scaler is not None:
         scaler.unscale_(optimizer)
         # In distributed training, all ranks must agree on whether to skip the step.
         # Each rank may independently encounter inf/nan gradients, so we all-reduce
         # the found_inf flag (MAX = if any rank found inf, all ranks skip).
+        found_inf_values = list(scaler._found_inf_per_device(optimizer).values())
         if is_ddp_initialized():
-            for v in scaler._found_inf_per_device(optimizer).values():
+            for v in found_inf_values:
                 dist.all_reduce(v, op=dist.ReduceOp.MAX)
+        step_skipped_by_scaler = any(float(v.item()) != 0.0 for v in found_inf_values)
         scaler.step(optimizer)
         scaler.update()
     else:
         optimizer.step()
+    if probe_this_step:
+        control_diagnostics = optimizer.consume_control_diagnostics(all_reduce=True)
+        if not step_skipped_by_scaler:
+            loss_before_probe = loss_before_probe_sum / max(1, loss_before_probe_count)
+            loss_after_probe = _average_probe_loss(model, probe_batches)
+            loss_before_probe = _all_reduce_mean_scalar(loss_before_probe, device)
+            loss_after_probe = _all_reduce_mean_scalar(loss_after_probe, device)
+            actual_total = loss_before_probe - loss_after_probe
+            control_feedback = select_control_feedback(
+                scope=args.control_feedback_scope,
+                actual_total=actual_total,
+                predicted_total=control_diagnostics["predicted_decrease_total"],
+                predicted_muon=control_diagnostics["predicted_decrease_muon"],
+                predicted_adamw=control_diagnostics["predicted_decrease_adamw"],
+                total_grad_norm=control_diagnostics["total_grad_norm"],
+                muon_grad_norm=control_diagnostics["muon_grad_norm"],
+                total_update_norm=control_diagnostics["total_update_norm"],
+                muon_update_norm=control_diagnostics["muon_update_norm"],
+            )
+            feedback_actual_override = (
+                None
+                if args.control_feedback_scope == "total"
+                else control_feedback.actual_for_control
+            )
+            control_stats = controller.update(
+                step=step,
+                loss_before=loss_before_probe,
+                loss_after=loss_after_probe,
+                predicted_decrease=control_feedback.predicted_for_control,
+                grad_norm=control_feedback.grad_norm_for_control,
+                update_norm=control_feedback.update_norm_for_control,
+                feedback_actual_decrease=feedback_actual_override,
+            )
     model.zero_grad(set_to_none=True)
     train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
     synchronize()
     t1 = time.time()
     dt = t1 - t0
+    log_local_metrics = local_metrics_enabled and (step % args.local_log_every == 0)
+    governed_stats = (
+        controller.last_governed_stats if autonomous_cooldown_enabled else None
+    )
+    if control_stats is not None and (controller.num_updates % args.control_log_every == 0):
+        assert control_feedback is not None
+        predicted_total = control_diagnostics["predicted_decrease_total"]
+        adamw_predicted_fraction = (
+            control_diagnostics["predicted_decrease_adamw"] / predicted_total
+            if math.isfinite(predicted_total) and predicted_total > 0.0
+            else ""
+        )
+        row = {
+            "step": step,
+            "tokens": total_batch_size * step,
+            "alpha": control_stats.alpha,
+            "alpha_next": control_stats.alpha_next,
+            "alpha_update_factor": control_stats.alpha_update_factor,
+            "alpha_mode": args.control_alpha_mode,
+            "control_scope": args.control_scope,
+            "feedback_scope": args.control_feedback_scope,
+            "native_lrm": lrm,
+            "native_muon_lr_min": native_muon_lr_min,
+            "native_muon_lr_max": native_muon_lr_max,
+            "muon_lr_min": muon_lr_min,
+            "muon_lr_max": muon_lr_max,
+            "adamw_lr_min": adamw_lr_min,
+            "adamw_lr_max": adamw_lr_max,
+            "effective_muon_lr_min": effective_muon_lr_min,
+            "effective_muon_lr_max": effective_muon_lr_max,
+            "effective_muon_lr_mean": effective_muon_lr_mean,
+            "rho": control_stats.rho,
+            "rho_clipped": control_stats.rho_clipped,
+            "rho_ema": control_stats.rho_ema,
+            "rho_control": control_stats.rho_control,
+            "loss_before_probe": control_stats.loss_before,
+            "loss_after_probe": control_stats.loss_after,
+            "actual_decrease": control_stats.actual_decrease,
+            "feedback_actual_decrease": control_feedback.actual_for_control,
+            "feedback_predicted_decrease": control_feedback.predicted_for_control,
+            "rho_total": control_feedback.rho_total,
+            "rho_muon_residual_proxy": control_feedback.rho_muon_residual_proxy,
+            "adamw_predicted_fraction": adamw_predicted_fraction,
+            "predicted_decrease_total": control_diagnostics["predicted_decrease_total"],
+            "predicted_decrease_muon": control_diagnostics["predicted_decrease_muon"],
+            "predicted_decrease_adamw": control_diagnostics["predicted_decrease_adamw"],
+            "predicted_decrease_safe": control_stats.predicted_decrease_safe,
+            "control_error": control_stats.control_error,
+            "p_term": control_stats.p_term,
+            "i_term": control_stats.i_term,
+            "d_term": control_stats.d_term,
+            "control_log_factor": control_stats.control_log_factor,
+            "integral_state": control_stats.integral_state,
+            "derivative_state": control_stats.derivative_state,
+            "muon_update_norm": control_diagnostics["muon_update_norm"],
+            "adamw_update_norm": control_diagnostics["adamw_update_norm"],
+            "total_update_norm": control_diagnostics["total_update_norm"],
+            "muon_grad_norm": control_diagnostics["muon_grad_norm"],
+            "adamw_grad_norm": control_diagnostics["adamw_grad_norm"],
+            "total_grad_norm": control_diagnostics["total_grad_norm"],
+            "num_muon_params": int(round(control_diagnostics["num_muon_params"])),
+            "num_adamw_params": int(round(control_diagnostics["num_adamw_params"])),
+            "num_muon_tensors": int(round(control_diagnostics["num_muon_tensors"])),
+            "num_adamw_tensors": int(round(control_diagnostics["num_adamw_tensors"])),
+            "factor_applied": control_stats.factor_applied,
+            "trust_region_expanded": int(control_stats.trust_region_expanded),
+            "trust_good_count": control_stats.trust_good_count,
+            "alignment_c": control_stats.alignment_c,
+            "alignment_penalty_term": control_stats.alignment_penalty_term,
+            "alignment_allows_trust_expansion": int(control_stats.alignment_allows_trust_expansion),
+            "alignment_bad_step": int(control_stats.alignment_bad_step),
+            "probe_scope": args.control_probe_scope,
+            "probe_num_microbatches": loss_before_probe_count,
+            "predicted_was_floored": int(control_stats.predicted_was_floored),
+            "rho_was_clipped": int(control_stats.rho_was_clipped),
+            "integral_accumulation_frozen": int(control_stats.integral_accumulation_frozen),
+            "cooldown_alpha_proposed": "" if governed_stats is None else governed_stats.alpha_proposed,
+            "cooldown_alpha_cap_target": "" if governed_stats is None else governed_stats.alpha_cap_target,
+            "cooldown_alpha_cap": "" if governed_stats is None else governed_stats.alpha_cap,
+            "cooldown_alpha_applied": "" if governed_stats is None else governed_stats.alpha_applied,
+            "cooldown_cap_is_binding": "" if governed_stats is None else int(governed_stats.cap_is_binding),
+            "cooldown_governor_state": "" if governed_stats is None else governed_stats.governor_state,
+            "cooldown_event_count": "" if governed_stats is None else governed_stats.cooldown_event_count,
+            "skipped_reason": control_stats.skipped_reason or ("step_skipped_by_scaler" if step_skipped_by_scaler else ""),
+            "dt_seconds": dt,
+        }
+        _write_csv_row(controller_csv_writer, controller_csv_file, row)
     # -------------------------------------------------------------------------
 
     # logging (CPU action only)
     ema_beta = 0.9 # EMA decay factor for some smoothing just for nicer logging
     smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f # EMA the training loss
     debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1)) # debias the EMA
-    pct_done = 100 * step / num_iterations
+    pct_done = 100 * step / stop_step
     tok_per_sec = int(total_batch_size / dt)
     flops_per_sec = num_flops_per_token * total_batch_size / dt
     mfu = 100 * flops_per_sec / (gpu_peak_flops * ddp_world_size)
     if step > 10:
         total_training_time += dt # only count the time after the first 10 steps
+    if log_local_metrics:
+        _write_csv_row(train_csv_writer, train_csv_file, {
+            "step": step,
+            "tokens": total_batch_size * step,
+            "train_loss": train_loss_f,
+            "smooth_train_loss": debiased_smooth_loss,
+            "lrm": lrm,
+            "dt_seconds": dt,
+            "tok_per_sec": tok_per_sec,
+            "mfu": mfu,
+            "total_training_time_seconds": total_training_time,
+            "alpha": "" if controller is None else control_alpha_applied,
+            "native_muon_lr_min": native_muon_lr_min,
+            "native_muon_lr_max": native_muon_lr_max,
+            "muon_lr_min": muon_lr_min,
+            "muon_lr_max": muon_lr_max,
+            "muon_lr_mean": muon_lr_mean,
+            "effective_muon_lr_mean": effective_muon_lr_mean,
+        })
     # Calculate ETA based on average time per step (excluding first 10 steps)
     steps_done = step - 10
     if steps_done > 0:
         avg_time_per_step = total_training_time / steps_done
-        remaining_steps = num_iterations - step
+        remaining_steps = stop_step - step
         eta_seconds = remaining_steps * avg_time_per_step
         eta_str = f" | eta: {eta_seconds/60:.1f}m"
     else:
         eta_str = ""
     epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
-    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
+    print0(f"step {step:05d}/{stop_step:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
     if step % 100 == 0:
         log_data = {
             "step": step,
@@ -577,6 +1274,22 @@ while True:
             "train/mfu": mfu,
             "train/epoch": epoch,
         }
+        if control_stats is not None:
+            log_data.update({
+                "control/alpha": control_stats.alpha,
+                "control/alpha_next": control_stats.alpha_next,
+                "control/rho": control_stats.rho,
+                "control/rho_ema": control_stats.rho_ema,
+                "control/loss_before_probe": control_stats.loss_before,
+                "control/loss_after_probe": control_stats.loss_after,
+                "control/predicted_decrease_total": control_diagnostics["predicted_decrease_total"],
+                "control/predicted_decrease_muon": control_diagnostics["predicted_decrease_muon"],
+                "control/predicted_decrease_adamw": control_diagnostics["predicted_decrease_adamw"],
+                "control/feedback_actual_decrease": control_feedback.actual_for_control,
+                "control/feedback_predicted_decrease": control_feedback.predicted_for_control,
+                "control/rho_total": control_feedback.rho_total,
+                "control/rho_muon_residual_proxy": control_feedback.rho_muon_residual_proxy,
+            })
         wandb_run.log(log_data)
 
     # state update
@@ -598,6 +1311,14 @@ print0(f"Peak memory usage: {get_max_memory() / 1024 / 1024:.2f}MiB")
 print0(f"Total training time: {total_training_time/60:.2f}m")
 if val_bpb is not None:
     print0(f"Minimum validation bpb: {min_val_bpb:.6f}")
+if controller_csv_file is not None:
+    controller_csv_file.close()
+if train_csv_file is not None:
+    train_csv_file.close()
+if eval_csv_file is not None:
+    eval_csv_file.close()
+if cooldown_csv_file is not None:
+    cooldown_csv_file.close()
 
 # cleanup
 wandb_run.finish() # wandb run finish

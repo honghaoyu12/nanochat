@@ -270,6 +270,69 @@ class MuonAdamW(torch.optim.Optimizer):
         self._muon_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._muon_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._muon_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._control_diagnostics_enabled = False
+        self._control_diagnostics_include_adamw = True
+        self._control_diagnostics = self._empty_control_diagnostics()
+
+    @staticmethod
+    def _empty_control_diagnostics() -> dict:
+        return {
+            "predicted_decrease_muon": 0.0,
+            "predicted_decrease_adamw": 0.0,
+            "muon_update_norm_sq": 0.0,
+            "adamw_update_norm_sq": 0.0,
+            "muon_grad_norm_sq": 0.0,
+            "adamw_grad_norm_sq": 0.0,
+            "muon_param_norm_sq": 0.0,
+            "adamw_param_norm_sq": 0.0,
+            "num_muon_params": 0,
+            "num_adamw_params": 0,
+            "num_muon_tensors": 0,
+            "num_adamw_tensors": 0,
+        }
+
+    def set_control_diagnostics(self, enabled: bool, include_adamw: bool = True) -> None:
+        self._control_diagnostics_enabled = bool(enabled)
+        self._control_diagnostics_include_adamw = bool(include_adamw)
+        if enabled:
+            self._control_diagnostics = self._empty_control_diagnostics()
+
+    def _accumulate_control_diagnostic(self, key: str, value: float) -> None:
+        self._control_diagnostics[key] += float(value)
+
+    def consume_control_diagnostics(self, all_reduce: bool = True) -> dict:
+        diagnostics = dict(self._control_diagnostics)
+        if (
+            all_reduce
+            and dist.is_available()
+            and dist.is_initialized()
+            and dist.get_world_size() > 1
+        ):
+            keys = list(diagnostics.keys())
+            first_param = next(
+                (p for group in self.param_groups for p in group["params"] if p is not None),
+                None,
+            )
+            device = first_param.device if first_param is not None else torch.device("cpu")
+            values = torch.tensor([float(diagnostics[k]) for k in keys], dtype=torch.float64, device=device)
+            dist.all_reduce(values, op=dist.ReduceOp.SUM)
+            diagnostics = {k: values[i].item() for i, k in enumerate(keys)}
+        diagnostics["predicted_decrease_total"] = diagnostics["predicted_decrease_muon"] + diagnostics["predicted_decrease_adamw"]
+        diagnostics["total_update_norm_sq"] = diagnostics["muon_update_norm_sq"] + diagnostics["adamw_update_norm_sq"]
+        diagnostics["total_grad_norm_sq"] = diagnostics["muon_grad_norm_sq"] + diagnostics["adamw_grad_norm_sq"]
+        diagnostics["total_param_norm_sq"] = diagnostics["muon_param_norm_sq"] + diagnostics["adamw_param_norm_sq"]
+        diagnostics["muon_update_norm"] = diagnostics["muon_update_norm_sq"] ** 0.5
+        diagnostics["adamw_update_norm"] = diagnostics["adamw_update_norm_sq"] ** 0.5
+        diagnostics["total_update_norm"] = diagnostics["total_update_norm_sq"] ** 0.5
+        diagnostics["muon_grad_norm"] = diagnostics["muon_grad_norm_sq"] ** 0.5
+        diagnostics["adamw_grad_norm"] = diagnostics["adamw_grad_norm_sq"] ** 0.5
+        diagnostics["total_grad_norm"] = diagnostics["total_grad_norm_sq"] ** 0.5
+        diagnostics["muon_param_norm"] = diagnostics["muon_param_norm_sq"] ** 0.5
+        diagnostics["adamw_param_norm"] = diagnostics["adamw_param_norm_sq"] ** 0.5
+        diagnostics["total_param_norm"] = diagnostics["total_param_norm_sq"] ** 0.5
+        self._control_diagnostics_enabled = False
+        self._control_diagnostics = self._empty_control_diagnostics()
+        return diagnostics
 
     def _reduce_adamw(self, group: dict, world_size: int) -> dict:
         """Launch async reduce ops for AdamW group. Returns info dict with per-param infos."""
@@ -341,6 +404,18 @@ class MuonAdamW(torch.optim.Optimizer):
                 state['exp_avg_sq'] = torch.zeros_like(p_slice)
             state['step'] += 1
 
+            # Small AdamW params are replicated on every rank after all_reduce(AVG).
+            # Record their diagnostics on rank 0 only so the later SUM all-reduce
+            # counts the global parameter update once, not once per rank.
+            capture_diagnostics = (
+                self._control_diagnostics_enabled
+                and self._control_diagnostics_include_adamw
+                and (world_size == 1 or not pinfo['is_small'] or rank == 0)
+            )
+            if capture_diagnostics:
+                p_before = p_slice.detach().clone()
+                grad_for_diag = grad_slice.detach().clone()
+
             # Fill 0-D tensors and run fused kernel
             self._adamw_step_t.fill_(state['step'])
             self._adamw_lr_t.fill_(group['lr'])
@@ -353,6 +428,15 @@ class MuonAdamW(torch.optim.Optimizer):
                 self._adamw_step_t, self._adamw_lr_t, self._adamw_beta1_t,
                 self._adamw_beta2_t, self._adamw_eps_t, self._adamw_wd_t,
             )
+
+            if capture_diagnostics:
+                delta = p_slice.detach() - p_before
+                self._accumulate_control_diagnostic("predicted_decrease_adamw", -(grad_for_diag.float() * delta.float()).sum().item())
+                self._accumulate_control_diagnostic("adamw_update_norm_sq", delta.float().square().sum().item())
+                self._accumulate_control_diagnostic("adamw_grad_norm_sq", grad_for_diag.float().square().sum().item())
+                self._accumulate_control_diagnostic("adamw_param_norm_sq", p_before.float().square().sum().item())
+                self._control_diagnostics["num_adamw_params"] += int(p_slice.numel())
+                self._control_diagnostics["num_adamw_tensors"] += 1
 
             # Large params need all_gather
             if not pinfo['is_small']:
@@ -386,6 +470,10 @@ class MuonAdamW(torch.optim.Optimizer):
         if num_owned > 0:
             owned_params = [params[start_idx + i] for i in range(num_owned)]
             stacked_owned = torch.stack(owned_params)
+            capture_diagnostics = self._control_diagnostics_enabled
+            if capture_diagnostics:
+                p_before = stacked_owned.detach().clone()
+                grad_for_diag = grad_chunk[:num_owned].detach().clone()
 
             # Fill 0-D tensors and run fused kernel
             self._muon_momentum_t.fill_(group["momentum"])
@@ -398,6 +486,15 @@ class MuonAdamW(torch.optim.Optimizer):
                 self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t, self._muon_beta2_t,
                 group["ns_steps"], red_dim,
             )
+
+            if capture_diagnostics:
+                delta = stacked_owned.detach() - p_before
+                self._accumulate_control_diagnostic("predicted_decrease_muon", -(grad_for_diag.float() * delta.float()).sum().item())
+                self._accumulate_control_diagnostic("muon_update_norm_sq", delta.float().square().sum().item())
+                self._accumulate_control_diagnostic("muon_grad_norm_sq", grad_for_diag.float().square().sum().item())
+                self._accumulate_control_diagnostic("muon_param_norm_sq", p_before.float().square().sum().item())
+                self._control_diagnostics["num_muon_params"] += int(stacked_owned.numel())
+                self._control_diagnostics["num_muon_tensors"] += int(num_owned)
 
         if info['stacked_grads'] is None:
             # Single rank: no gather needed, the updated stack maps directly onto the params
@@ -457,3 +554,102 @@ class MuonAdamW(torch.optim.Optimizer):
 
         # Phase 3: wait for gathers, copy back
         self._finish_gathers(gather_list)
+
+
+# -----------------------------------------------------------------------------
+
+class TorchMuonAdamW(torch.optim.Optimizer):
+    """Reference optimizer wrapper using local torch.optim.Muon.
+
+    This baseline keeps nanochat's parameter split and LR scheduling interface,
+    but uses PyTorch's official dense Muon implementation for matrix groups and
+    torch.optim.AdamW for AdamW groups. It is intended for single-rank reference
+    benchmarking. It does not implement nanochat's fused/distributed optimizer
+    mechanics.
+    """
+
+    def __init__(self, param_groups: list[dict]):
+        super().__init__(param_groups, defaults={})
+        self._adamw_indices: list[int] = []
+        self._muon_indices: list[int] = []
+        adamw_groups = []
+        muon_groups = []
+        for idx, group in enumerate(self.param_groups):
+            if group["kind"] == "adamw":
+                self._adamw_indices.append(idx)
+                adamw_groups.append(self._adamw_group_for_torch(group))
+            elif group["kind"] == "muon":
+                self._muon_indices.append(idx)
+                muon_groups.append(self._muon_group_for_torch(group))
+            else:
+                raise ValueError(f"Unknown optimizer kind: {group['kind']}")
+        self._adamw = torch.optim.AdamW(adamw_groups) if adamw_groups else None
+        self._muon = torch.optim.Muon(muon_groups) if muon_groups else None
+
+    @staticmethod
+    def _adamw_group_for_torch(group: dict) -> dict:
+        return {
+            "params": group["params"],
+            "lr": group["lr"],
+            "betas": group["betas"],
+            "eps": group["eps"],
+            "weight_decay": group["weight_decay"],
+        }
+
+    @staticmethod
+    def _muon_group_for_torch(group: dict) -> dict:
+        return {
+            "params": group["params"],
+            "lr": group["lr"],
+            "weight_decay": group["weight_decay"],
+            "momentum": group.get("momentum", 0.95),
+            "nesterov": group.get("nesterov", True),
+            "ns_steps": group.get("ns_steps", 5),
+            "adjust_lr_fn": group.get("adjust_lr_fn", "original"),
+        }
+
+    def _sync_from_param_groups(self) -> None:
+        if self._adamw is not None:
+            for src_idx, dst_group in zip(self._adamw_indices, self._adamw.param_groups):
+                src = self.param_groups[src_idx]
+                dst_group["lr"] = src["lr"]
+                dst_group["betas"] = src["betas"]
+                dst_group["eps"] = src["eps"]
+                dst_group["weight_decay"] = src["weight_decay"]
+        if self._muon is not None:
+            for src_idx, dst_group in zip(self._muon_indices, self._muon.param_groups):
+                src = self.param_groups[src_idx]
+                dst_group["lr"] = src["lr"]
+                dst_group["weight_decay"] = src["weight_decay"]
+                dst_group["momentum"] = src.get("momentum", dst_group["momentum"])
+                dst_group["ns_steps"] = src.get("ns_steps", dst_group["ns_steps"])
+                dst_group["adjust_lr_fn"] = src.get("adjust_lr_fn", dst_group["adjust_lr_fn"])
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        if closure is not None:
+            raise RuntimeError("TorchMuonAdamW does not support closure-based steps in nanochat")
+        self._sync_from_param_groups()
+        if self._adamw is not None:
+            self._adamw.step()
+        if self._muon is not None:
+            self._muon.step()
+        return None
+
+    def zero_grad(self, set_to_none: bool = True) -> None:
+        super().zero_grad(set_to_none=set_to_none)
+
+    def state_dict(self) -> dict:
+        return {
+            "wrapper": super().state_dict(),
+            "adamw": None if self._adamw is None else self._adamw.state_dict(),
+            "muon": None if self._muon is None else self._muon.state_dict(),
+        }
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        super().load_state_dict(state_dict["wrapper"])
+        if self._adamw is not None and state_dict.get("adamw") is not None:
+            self._adamw.load_state_dict(state_dict["adamw"])
+        if self._muon is not None and state_dict.get("muon") is not None:
+            self._muon.load_state_dict(state_dict["muon"])
+        self._sync_from_param_groups()

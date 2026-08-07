@@ -20,7 +20,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from nanochat.common import get_dist_info, print0, COMPUTE_DTYPE
-from nanochat.optim import MuonAdamW
+from nanochat.optim import MuonAdamW, TorchMuonAdamW
 
 # Our custom Flash Attention module that automatically uses FA3 when compatible and SDPA fallback otherwise
 from nanochat.flash_attention import flash_attn
@@ -416,7 +416,7 @@ class GPT(nn.Module):
             'total': total,
         }
 
-    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, scalar_lr=0.5):
+    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, scalar_lr=0.5, backend="native"):
         model_dim = self.config.n_embd
 
         # Separate out all parameters into groups
@@ -449,9 +449,15 @@ class GPT(nn.Module):
             param_groups.append(dict(
                 kind='muon', params=group_params, lr=matrix_lr,
                 momentum=0.95, ns_steps=5, beta2=0.9, weight_decay=weight_decay,
+                nesterov=True, adjust_lr_fn='original',
             ))
 
-        optimizer = MuonAdamW(param_groups)
+        if backend == 'native':
+            optimizer = MuonAdamW(param_groups)
+        elif backend == 'torch_muon':
+            optimizer = TorchMuonAdamW(param_groups)
+        else:
+            raise ValueError(f'unknown optimizer backend: {backend}')
         for group in optimizer.param_groups:
             group["initial_lr"] = group["lr"]
         return optimizer
