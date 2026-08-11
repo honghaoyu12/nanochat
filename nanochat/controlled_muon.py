@@ -95,10 +95,8 @@ def validate_control_feedback_configuration(
         return
     if not controlled:
         raise ValueError("muon_residual_proxy feedback requires a controlled optimizer")
-    if control_scope != "muon_only":
-        raise ValueError(
-            "muon_residual_proxy feedback requires control-scope=muon_only"
-        )
+    if control_scope not in {"muon_only", "all_groups"}:
+        raise ValueError(f"unknown control scope: {control_scope}")
 
 
 def control_feedback_state_dict(scope: str) -> dict[str, Any]:
@@ -206,6 +204,7 @@ class NanochatMuonControlStats:
     skipped_reason: str | None = None
     feedback_actual_decrease: float | None = None
     feedback_predicted_decrease: float | None = None
+    rho_star: float = 0.0
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -511,6 +510,7 @@ class NanochatMuonController:
         update_norm: float | None = None,
         feedback_actual_decrease: float | None = None,
         freeze_positive_integral: bool = False,
+        rho_star_override: float | None = None,
     ) -> NanochatMuonControlStats:
         loss_before_f = float(loss_before)
         loss_after_f = float(loss_after)
@@ -530,6 +530,7 @@ class NanochatMuonController:
             grad_norm=grad_norm,
             update_norm=update_norm,
             freeze_positive_integral=freeze_positive_integral,
+            rho_star_override=rho_star_override,
         )
 
     def update_from_observation(
@@ -544,6 +545,7 @@ class NanochatMuonController:
         grad_norm: float | None = None,
         update_norm: float | None = None,
         freeze_positive_integral: bool = False,
+        rho_star_override: float | None = None,
     ) -> NanochatMuonControlStats:
         """Update alpha from an explicitly selected feedback observation."""
         alpha_used = self.alpha
@@ -627,7 +629,10 @@ class NanochatMuonController:
             rho_control = self.rho_ema if self.rho_ema is not None else rho_clipped
         else:
             rho_control = rho_clipped
-        error = rho_control - self.rho_star
+        rho_star = self.rho_star if rho_star_override is None else float(rho_star_override)
+        if not math.isfinite(rho_star):
+            raise ValueError("rho_star_override must be finite")
+        error = rho_control - rho_star
         p_term, i_term, d_term, control_log_factor, derivative_state = self._compute_pid_terms(
             error,
             measurement_for_control_is_valid,
@@ -724,6 +729,7 @@ class NanochatMuonController:
             skipped_reason=skipped_reason,
             feedback_actual_decrease=feedback_actual_decrease,
             feedback_predicted_decrease=predicted_decrease,
+            rho_star=rho_star,
         )
         self.last_stats = stats
         return stats
@@ -742,4 +748,208 @@ class NanochatMuonController:
             "alignment_aware": self.alignment_aware,
             "num_updates": self.num_updates,
             "last_stats": None if self.last_stats is None else self.last_stats.as_dict(),
+        }
+
+class LossProgressRhoReference:
+    """Monotone, horizon-free rho target driven by smoothed loss progress."""
+
+    SCHEMA_VERSION = 1
+
+    def __init__(
+        self,
+        *,
+        rho_middle: float,
+        rho_late: float,
+        beta_fast: float = 0.90,
+        beta_slow: float = 0.99,
+        beta_reference: float = 0.999,
+        beta_phase: float = 0.99,
+        progress_ratio_high: float = 0.50,
+        progress_ratio_low: float = 0.10,
+        minimum_observations: int = 50,
+        eps: float = 1e-12,
+    ) -> None:
+        values = (
+            rho_middle,
+            rho_late,
+            beta_fast,
+            beta_slow,
+            beta_reference,
+            beta_phase,
+            progress_ratio_high,
+            progress_ratio_low,
+            eps,
+        )
+        if not all(math.isfinite(float(value)) for value in values):
+            raise ValueError("rho progress reference values must be finite")
+        if rho_middle >= rho_late:
+            raise ValueError("rho_middle must be smaller than rho_late")
+        if not 0.0 <= beta_fast < beta_slow < 1.0:
+            raise ValueError("rho progress betas must satisfy 0 <= fast < slow < 1")
+        if not 0.0 <= beta_reference < 1.0:
+            raise ValueError("beta_reference must be in [0, 1)")
+        if not 0.0 <= beta_phase < 1.0:
+            raise ValueError("beta_phase must be in [0, 1)")
+        if not 0.0 <= progress_ratio_low < progress_ratio_high <= 1.0:
+            raise ValueError(
+                "progress ratio thresholds must satisfy 0 <= low < high <= 1"
+            )
+        if minimum_observations < 1:
+            raise ValueError("minimum_observations must be positive")
+        if eps <= 0.0:
+            raise ValueError("eps must be positive")
+
+        self.rho_middle = float(rho_middle)
+        self.rho_late = float(rho_late)
+        self.beta_fast = float(beta_fast)
+        self.beta_slow = float(beta_slow)
+        self.beta_reference = float(beta_reference)
+        self.beta_phase = float(beta_phase)
+        self.progress_ratio_high = float(progress_ratio_high)
+        self.progress_ratio_low = float(progress_ratio_low)
+        self.minimum_observations = int(minimum_observations)
+        self.eps = float(eps)
+
+        self.observation_count = 0
+        self.loss_fast: float | None = None
+        self.loss_slow: float | None = None
+        self.relative_progress = 0.0
+        self.progress_reference = 0.0
+        self.progress_ratio = 1.0
+        self.phase_candidate = 0.0
+        self.phase = 0.0
+        self.rho_star = self.rho_middle
+
+    @staticmethod
+    def _same_float(saved: Any, configured: float) -> bool:
+        return math.isclose(
+            float(saved), configured, rel_tol=1e-12, abs_tol=1e-12
+        )
+
+    def observe(self, loss: float) -> float:
+        """Observe one training loss and return the current rho target."""
+        loss_f = float(loss)
+        if not math.isfinite(loss_f) or loss_f <= 0.0:
+            raise ValueError("training loss must be finite and positive")
+
+        if self.loss_fast is None:
+            self.loss_fast = loss_f
+            self.loss_slow = loss_f
+        else:
+            self.loss_fast = self.beta_fast * self.loss_fast + (1.0 - self.beta_fast) * loss_f
+            self.loss_slow = self.beta_slow * self.loss_slow + (1.0 - self.beta_slow) * loss_f
+
+        self.observation_count += 1
+        self.relative_progress = max(
+            0.0,
+            self.loss_slow - self.loss_fast,
+        ) / max(abs(self.loss_slow), self.eps)
+        self.progress_reference = max(
+            self.relative_progress,
+            self.beta_reference * self.progress_reference,
+        )
+        if self.progress_reference > self.eps:
+            self.progress_ratio = _clip(
+                self.relative_progress / self.progress_reference,
+                0.0,
+                1.0,
+            )
+        else:
+            self.progress_ratio = 1.0
+
+        if self.observation_count < self.minimum_observations:
+            self.phase_candidate = 0.0
+        else:
+            phase_linear = _clip(
+                (self.progress_ratio_high - self.progress_ratio)
+                / (self.progress_ratio_high - self.progress_ratio_low),
+                0.0,
+                1.0,
+            )
+            self.phase_candidate = phase_linear * phase_linear * (3.0 - 2.0 * phase_linear)
+        phase_filtered = (
+            self.beta_phase * self.phase
+            + (1.0 - self.beta_phase) * self.phase_candidate
+        )
+        self.phase = max(self.phase, _clip(phase_filtered, 0.0, 1.0))
+        self.rho_star = self.rho_middle + self.phase * (self.rho_late - self.rho_middle)
+        return self.rho_star
+
+    def state_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.SCHEMA_VERSION,
+            "rho_middle": self.rho_middle,
+            "rho_late": self.rho_late,
+            "beta_fast": self.beta_fast,
+            "beta_slow": self.beta_slow,
+            "beta_reference": self.beta_reference,
+            "beta_phase": self.beta_phase,
+            "progress_ratio_high": self.progress_ratio_high,
+            "progress_ratio_low": self.progress_ratio_low,
+            "minimum_observations": self.minimum_observations,
+            "eps": self.eps,
+            "observation_count": self.observation_count,
+            "loss_fast": self.loss_fast,
+            "loss_slow": self.loss_slow,
+            "relative_progress": self.relative_progress,
+            "progress_reference": self.progress_reference,
+            "progress_ratio": self.progress_ratio,
+            "phase_candidate": self.phase_candidate,
+            "phase": self.phase,
+            "rho_star": self.rho_star,
+        }
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        if int(state.get("schema_version", 1)) != self.SCHEMA_VERSION:
+            raise ValueError("unsupported rho progress reference schema")
+        for name in (
+            "rho_middle",
+            "rho_late",
+            "beta_fast",
+            "beta_slow",
+            "beta_reference",
+            "beta_phase",
+            "progress_ratio_high",
+            "progress_ratio_low",
+            "eps",
+        ):
+            if not self._same_float(state[name], getattr(self, name)):
+                raise ValueError(f"rho progress reference configuration mismatch: {name}")
+        if int(state["minimum_observations"]) != self.minimum_observations:
+            raise ValueError("rho progress reference configuration mismatch: minimum_observations")
+
+        self.observation_count = int(state.get("observation_count", 0))
+        self.loss_fast = None if state.get("loss_fast") is None else float(state["loss_fast"])
+        self.loss_slow = None if state.get("loss_slow") is None else float(state["loss_slow"])
+        self.relative_progress = float(state.get("relative_progress", 0.0))
+        self.progress_reference = float(state.get("progress_reference", 0.0))
+        self.progress_ratio = float(state.get("progress_ratio", 1.0))
+        self.phase_candidate = float(state.get("phase_candidate", 0.0))
+        self.phase = _clip(float(state.get("phase", 0.0)), 0.0, 1.0)
+        self.rho_star = float(state.get("rho_star", self.rho_middle))
+        if not all(
+            math.isfinite(value)
+            for value in (
+                self.relative_progress,
+                self.progress_reference,
+                self.progress_ratio,
+                self.phase_candidate,
+                self.phase,
+                self.rho_star,
+            )
+        ):
+            raise ValueError("rho progress reference state contains nonfinite values")
+
+    def diagnostics_dict(self) -> dict[str, Any]:
+        return {
+            "rho_reference_mode": "loss_progress",
+            "rho_star_applied": self.rho_star,
+            "rho_phase_observation_count": self.observation_count,
+            "rho_phase_loss_fast": self.loss_fast,
+            "rho_phase_loss_slow": self.loss_slow,
+            "rho_phase_relative_progress": self.relative_progress,
+            "rho_phase_progress_reference": self.progress_reference,
+            "rho_phase_progress_ratio": self.progress_ratio,
+            "rho_phase_candidate": self.phase_candidate,
+            "rho_phase": self.phase,
         }

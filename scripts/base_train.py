@@ -35,6 +35,7 @@ from nanochat.controlled_muon import (
     ABSOLUTE_GROUP_SCALING_MODES,
     CONTROL_FEEDBACK_SCOPES,
     NanochatMuonController,
+    LossProgressRhoReference,
     absolute_group_lr_scale,
     control_feedback_state_dict,
     select_control_feedback,
@@ -116,6 +117,16 @@ parser.add_argument("--control-alpha-min", type=float, default=-1.0, help="minim
 parser.add_argument("--control-alpha-max", type=float, default=-1.0, help="maximum alpha; -1 uses 2.0 * alpha_init")
 parser.add_argument("--control-alpha-replay-file", type=str, default="", help="reserved absolute alpha replay source")
 parser.add_argument("--control-rho-star", type=float, default=0.7, help="target rho")
+parser.add_argument("--control-rho-reference", type=str, default="fixed", choices=["fixed", "loss_progress"], help="fixed rho target or loss-progress phased target")
+parser.add_argument("--control-rho-middle", type=float, default=None, help="middle-phase rho target for loss_progress reference")
+parser.add_argument("--control-rho-late", type=float, default=None, help="late-phase rho target for loss_progress reference")
+parser.add_argument("--control-rho-progress-fast-beta", type=float, default=0.90, help="fast loss EMA beta for phased rho reference")
+parser.add_argument("--control-rho-progress-slow-beta", type=float, default=0.99, help="slow loss EMA beta for phased rho reference")
+parser.add_argument("--control-rho-progress-reference-beta", type=float, default=0.999, help="decay beta for observed progress scale")
+parser.add_argument("--control-rho-phase-beta", type=float, default=0.99, help="smoothing beta for phased rho target")
+parser.add_argument("--control-rho-progress-ratio-high", type=float, default=0.50, help="progress ratio at phase zero")
+parser.add_argument("--control-rho-progress-ratio-low", type=float, default=0.10, help="progress ratio at phase one")
+parser.add_argument("--control-rho-progress-min-observations", type=int, default=50, help="loss observations required before phase can advance")
 parser.add_argument("--control-kp", type=float, default=1.0, help="P-controller gain")
 parser.add_argument("--control-ki", type=float, default=0.0, help="I-controller gain for PI/PID variants; must be >0 for PI/PID")
 parser.add_argument("--control-kd", type=float, default=0.0, help="D-controller gain for PID variants; must be >0 for PID")
@@ -191,6 +202,15 @@ if args.optimizer_variant in CONTROLLED_MUON_VARIANTS and not args.controlled_mu
     args.controlled_muon = True
 if args.controlled_muon and args.optimizer_variant not in CONTROLLED_MUON_VARIANTS:
     raise ValueError("--controlled-muon requires a controlled_muon_* optimizer variant")
+control_rho_middle = args.control_rho_star if args.control_rho_middle is None else args.control_rho_middle
+control_rho_late = args.control_rho_late
+if args.control_rho_reference == "loss_progress":
+    if args.optimizer_variant not in {"controlled_muon_raw", "controlled_muon_ema", "controlled_muon_ema_trust"}:
+        raise ValueError("loss_progress rho reference is currently supported only for P controlled_muon variants")
+    if control_rho_late is None:
+        raise ValueError("loss_progress rho reference requires --control-rho-late")
+    if args.control_alpha_warmup_steps != 0 or args.control_start_step not in {-1, 0}:
+        raise ValueError("loss_progress rho reference requires zero controller alpha warmup and control-start-step=0")
 if args.control_alignment_aware and args.optimizer_variant not in CONTROLLED_MUON_VARIANTS:
     raise ValueError("--control-alignment-aware requires a controlled P/PI/PID Muon variant")
 if args.seed < 0:
@@ -530,6 +550,19 @@ for group in optimizer.param_groups:
         initial_lr=float(group["initial_lr"]),
         anchor_lr=native_muon_reference_peak_lr,
     )
+rho_reference = None
+if controlled_muon_enabled and args.control_rho_reference == "loss_progress":
+    rho_reference = LossProgressRhoReference(
+        rho_middle=control_rho_middle,
+        rho_late=control_rho_late,
+        beta_fast=args.control_rho_progress_fast_beta,
+        beta_slow=args.control_rho_progress_slow_beta,
+        beta_reference=args.control_rho_progress_reference_beta,
+        beta_phase=args.control_rho_phase_beta,
+        progress_ratio_high=args.control_rho_progress_ratio_high,
+        progress_ratio_low=args.control_rho_progress_ratio_low,
+        minimum_observations=args.control_rho_progress_min_observations,
+    )
 controller = None
 control_output_dir = args.control_output_dir
 if controlled_muon_enabled:
@@ -547,7 +580,7 @@ if controlled_muon_enabled:
         alpha_init=alpha_init,
         alpha_min=alpha_min,
         alpha_max=alpha_max,
-        rho_star=args.control_rho_star,
+        rho_star=control_rho_middle if rho_reference is not None else args.control_rho_star,
         kp=args.control_kp,
         ki=args.control_ki,
         kd=args.control_kd,
@@ -602,6 +635,17 @@ if controlled_muon_enabled:
         controller_state = meta_data.get("loop_state", {}).get("controlled_muon_controller")
         if controller_state is not None:
             controller.load_state_dict(controller_state)
+        saved_reference_mode = meta_data.get("user_config", {}).get("control_rho_reference", "fixed")
+        if saved_reference_mode != args.control_rho_reference:
+            raise ValueError(f"cannot resume {saved_reference_mode} rho reference with {args.control_rho_reference} configured")
+        saved_reference_state = meta_data.get("loop_state", {}).get("controlled_muon_rho_reference")
+        if rho_reference is None:
+            if saved_reference_state is not None:
+                raise ValueError("dynamic rho reference checkpoint requires --control-rho-reference=loss_progress")
+        elif saved_reference_state is None:
+            raise ValueError("loss_progress rho reference checkpoint state is missing")
+        else:
+            rho_reference.load_state_dict(saved_reference_state)
         validate_resumed_control_feedback(
             configured_scope=args.control_feedback_scope,
             saved_state=meta_data.get("loop_state", {}).get(
@@ -636,6 +680,8 @@ if local_metrics_enabled and master_process:
         "native_muon_reference_peak_lr": native_muon_reference_peak_lr,
         "scaled_absolute_all_groups_enabled": scaled_absolute_all_groups_enabled,
         "control_feedback": control_feedback_state_dict(args.control_feedback_scope),
+        "control_rho_reference": args.control_rho_reference,
+        "rho_reference": None if rho_reference is None else rho_reference.state_dict(),
     }
     with open(metadata_path, "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2)
@@ -650,6 +696,9 @@ controller_csv_fields = [
     "muon_lr_max", "adamw_lr_min", "adamw_lr_max",
     "effective_muon_lr_min", "effective_muon_lr_max",
     "effective_muon_lr_mean", "rho", "rho_clipped", "rho_ema", "rho_control",
+    "rho_star_applied", "rho_reference_mode", "rho_phase_observation_count", "rho_phase_loss_fast",
+    "rho_phase_loss_slow", "rho_phase_relative_progress", "rho_phase_progress_reference",
+    "rho_phase_progress_ratio", "rho_phase_candidate", "rho_phase",
     "loss_before_probe", "loss_after_probe", "actual_decrease",
     "feedback_actual_decrease", "feedback_predicted_decrease",
     "rho_total", "rho_muon_residual_proxy", "adamw_predicted_fraction",
@@ -984,6 +1033,7 @@ while True:
                     "total_training_time": total_training_time,
                     "controlled_muon_controller": None if controller is None else controller.state_dict(),
                     "controlled_muon_feedback": None if controller is None else control_feedback_state_dict(args.control_feedback_scope),
+                    "controlled_muon_rho_reference": None if rho_reference is None else rho_reference.state_dict(),
                 },
             },
             rank=ddp_rank,
@@ -1078,6 +1128,9 @@ while True:
     effective_muon_lr_min = min(effective_muon_lr_values) if effective_muon_lr_values else ""
     effective_muon_lr_max = max(effective_muon_lr_values) if effective_muon_lr_values else ""
     effective_muon_lr_mean = sum(effective_muon_lr_values) / len(effective_muon_lr_values) if effective_muon_lr_values else ""
+    if rho_reference is not None:
+        train_loss_f = train_loss.item()
+        rho_reference.observe(_all_reduce_mean_scalar(train_loss_f, device))
     if probe_this_step:
         optimizer.set_control_diagnostics(True, include_adamw=True)
     step_skipped_by_scaler = False
@@ -1127,9 +1180,11 @@ while True:
                 grad_norm=control_feedback.grad_norm_for_control,
                 update_norm=control_feedback.update_norm_for_control,
                 feedback_actual_decrease=feedback_actual_override,
+                rho_star_override=None if rho_reference is None else rho_reference.rho_star,
             )
     model.zero_grad(set_to_none=True)
-    train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
+    if rho_reference is None:
+        train_loss_f = train_loss.item()
     synchronize()
     t1 = time.time()
     dt = t1 - t0
@@ -1168,6 +1223,16 @@ while True:
             "rho_clipped": control_stats.rho_clipped,
             "rho_ema": control_stats.rho_ema,
             "rho_control": control_stats.rho_control,
+            "rho_star_applied": control_stats.rho_star,
+            "rho_reference_mode": args.control_rho_reference,
+            "rho_phase_observation_count": "" if rho_reference is None else rho_reference.observation_count,
+            "rho_phase_loss_fast": "" if rho_reference is None else rho_reference.loss_fast,
+            "rho_phase_loss_slow": "" if rho_reference is None else rho_reference.loss_slow,
+            "rho_phase_relative_progress": "" if rho_reference is None else rho_reference.relative_progress,
+            "rho_phase_progress_reference": "" if rho_reference is None else rho_reference.progress_reference,
+            "rho_phase_progress_ratio": "" if rho_reference is None else rho_reference.progress_ratio,
+            "rho_phase_candidate": "" if rho_reference is None else rho_reference.phase_candidate,
+            "rho_phase": "" if rho_reference is None else rho_reference.phase,
             "loss_before_probe": control_stats.loss_before,
             "loss_after_probe": control_stats.loss_after,
             "actual_decrease": control_stats.actual_decrease,
