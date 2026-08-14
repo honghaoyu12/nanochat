@@ -205,6 +205,13 @@ class NanochatMuonControlStats:
     feedback_actual_decrease: float | None = None
     feedback_predicted_decrease: float | None = None
     rho_star: float = 0.0
+    feedback_observation_valid: bool = True
+    feedback_invalid_reason: str | None = None
+    startup_active: bool = False
+    startup_alpha_reference: float | None = None
+    startup_log_term: float = 0.0
+    startup_emergency: bool = False
+    startup_monotone_clamped: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -267,6 +274,11 @@ class NanochatMuonController:
         alignment_bad_step_shrink: float = 0.5,
         alignment_max_log_alpha_change: float = 0.05,
         alignment_eps: float = 1e-12,
+        startup_alpha_reference_ratio: float = 1.0,
+        startup_alpha_reference_gain: float = 0.5,
+        startup_one_sided_safety: bool = False,
+        startup_monotone: bool = False,
+        startup_emergency_rho: float = -0.25,
     ) -> None:
         if variant not in self.VALID_VARIANTS:
             raise ValueError(f"unknown controlled Muon variant: {variant}")
@@ -298,6 +310,12 @@ class NanochatMuonController:
             raise ValueError("alignment_max_log_alpha_change must be finite and positive")
         if not math.isfinite(alignment_eps) or alignment_eps <= 0:
             raise ValueError("alignment_eps must be finite and positive")
+        if not math.isfinite(startup_alpha_reference_ratio) or startup_alpha_reference_ratio < 1.0:
+            raise ValueError("startup alpha reference ratio must be finite and at least 1")
+        if not math.isfinite(startup_alpha_reference_gain) or startup_alpha_reference_gain <= 0:
+            raise ValueError("startup alpha reference gain must be finite and positive")
+        if not math.isfinite(startup_emergency_rho):
+            raise ValueError("startup emergency rho must be finite")
 
         self.variant = variant
         self.controller_family = self._parse_family(variant)
@@ -336,6 +354,12 @@ class NanochatMuonController:
         self.alignment_bad_step_shrink = float(alignment_bad_step_shrink)
         self.alignment_max_log_alpha_change = float(alignment_max_log_alpha_change)
         self.alignment_eps = float(alignment_eps)
+        self.alpha_init = self.alpha
+        self.startup_alpha_reference_ratio = float(startup_alpha_reference_ratio)
+        self.startup_alpha_reference_gain = float(startup_alpha_reference_gain)
+        self.startup_one_sided_safety = bool(startup_one_sided_safety)
+        self.startup_monotone = bool(startup_monotone)
+        self.startup_emergency_rho = float(startup_emergency_rho)
 
         self.use_rho_ema = variant.endswith("_ema") or variant.endswith("_ema_trust")
         self.use_trust_region = variant.endswith("_ema_trust")
@@ -389,6 +413,12 @@ class NanochatMuonController:
             "alignment_bad_step_shrink": self.alignment_bad_step_shrink,
             "alignment_max_log_alpha_change": self.alignment_max_log_alpha_change,
             "alignment_eps": self.alignment_eps,
+            "alpha_init": self.alpha_init,
+            "startup_alpha_reference_ratio": self.startup_alpha_reference_ratio,
+            "startup_alpha_reference_gain": self.startup_alpha_reference_gain,
+            "startup_one_sided_safety": self.startup_one_sided_safety,
+            "startup_monotone": self.startup_monotone,
+            "startup_emergency_rho": self.startup_emergency_rho,
             "rho_ema": self.rho_ema,
             "integral_state": self.integral_state,
             "derivative_state": self.derivative_state,
@@ -430,6 +460,10 @@ class NanochatMuonController:
             "alignment_bad_step_shrink",
             "alignment_max_log_alpha_change",
             "alignment_eps",
+            "alpha_init",
+            "startup_alpha_reference_ratio",
+            "startup_alpha_reference_gain",
+            "startup_emergency_rho",
         ):
             if name in state:
                 setattr(self, name, float(state[name]))
@@ -438,6 +472,10 @@ class NanochatMuonController:
         saved_alignment_aware = bool(state.get("alignment_aware", self.alignment_aware))
         if saved_alignment_aware != self.alignment_aware:
             raise ValueError("cannot load controller state with different alignment-aware semantics")
+        for name in ("startup_one_sided_safety", "startup_monotone"):
+            saved = bool(state.get(name, getattr(self, name)))
+            if saved != getattr(self, name):
+                raise ValueError(f"cannot load controller state with different {name} semantics")
 
         self.controller_family = self._parse_family(self.variant)
         self.alpha = _clip(float(state["alpha"]), self.alpha_min, self.alpha_max)
@@ -509,6 +547,9 @@ class NanochatMuonController:
         grad_norm: float | None = None,
         update_norm: float | None = None,
         feedback_actual_decrease: float | None = None,
+        feedback_observation_valid: bool = True,
+        feedback_invalid_reason: str | None = None,
+        startup_active: bool = False,
         freeze_positive_integral: bool = False,
         rho_star_override: float | None = None,
     ) -> NanochatMuonControlStats:
@@ -529,6 +570,9 @@ class NanochatMuonController:
             predicted_decrease_for_control=predicted_decrease,
             grad_norm=grad_norm,
             update_norm=update_norm,
+            feedback_observation_valid=feedback_observation_valid,
+            feedback_invalid_reason=feedback_invalid_reason,
+            startup_active=startup_active,
             freeze_positive_integral=freeze_positive_integral,
             rho_star_override=rho_star_override,
         )
@@ -544,6 +588,9 @@ class NanochatMuonController:
         predicted_decrease_for_control: float,
         grad_norm: float | None = None,
         update_norm: float | None = None,
+        feedback_observation_valid: bool = True,
+        feedback_invalid_reason: str | None = None,
+        startup_active: bool = False,
         freeze_positive_integral: bool = False,
         rho_star_override: float | None = None,
     ) -> NanochatMuonControlStats:
@@ -616,9 +663,17 @@ class NanochatMuonController:
                 elif feedback_actual_decrease <= 0.0:
                     skipped_reason = "nonpositive_actual_decrease"
 
+        feedback_observation_valid = bool(feedback_observation_valid)
         measurement_for_control_is_valid = (
-            predicted_is_valid and rho_is_valid and not alignment_bad_step
+            feedback_observation_valid
+            and predicted_is_valid
+            and rho_is_valid
+            and not alignment_bad_step
         )
+        if not feedback_observation_valid and feedback_invalid_reason is None:
+            feedback_invalid_reason = "feedback_observation_invalid"
+        if not feedback_observation_valid:
+            skipped_reason = feedback_invalid_reason
 
         if self.use_rho_ema:
             if measurement_for_control_is_valid:
@@ -649,11 +704,34 @@ class NanochatMuonController:
                 -self.alignment_max_log_alpha_change,
                 self.alignment_max_log_alpha_change,
             )
+        startup_alpha_reference = None
+        startup_log_term = 0.0
+        startup_emergency = alignment_bad_step
+        if startup_active and self.startup_alpha_reference_ratio > 1.0:
+            startup_alpha_reference = _clip(
+                self.alpha_init * self.startup_alpha_reference_ratio,
+                self.alpha_min,
+                self.alpha_max,
+            )
+            startup_log_term = self.startup_alpha_reference_gain * math.log(
+                startup_alpha_reference / alpha_used
+            )
+            control_log_factor += startup_log_term
+            startup_emergency = startup_emergency or (
+                measurement_for_control_is_valid
+                and rho_control <= self.startup_emergency_rho
+            )
+            if self.startup_one_sided_safety and not startup_emergency:
+                control_log_factor = max(0.0, control_log_factor)
+                if startup_alpha_reference is not None and alpha_used < startup_alpha_reference:
+                    control_log_factor = max(control_log_factor, math.log(self.factor_max))
         raw_factor = math.exp(control_log_factor)
         factor = _clip(raw_factor, self.factor_min, self.factor_max)
         if alignment_bad_step:
             factor = self.alignment_bad_step_shrink
-        elif not measurement_for_control_is_valid:
+        elif not measurement_for_control_is_valid and not (
+            startup_active and startup_log_term > 0.0
+        ):
             factor = min(factor, 1.0)
 
         if (
@@ -686,6 +764,15 @@ class NanochatMuonController:
         factor = _clip(factor, factor_lower, hard_factor_max)
 
         alpha_next = _clip(alpha_used * factor, self.alpha_min, self.alpha_max)
+        startup_monotone_clamped = False
+        if (
+            startup_active
+            and self.startup_monotone
+            and not startup_emergency
+            and alpha_next < alpha_used
+        ):
+            alpha_next = alpha_used
+            startup_monotone_clamped = True
         self.alpha = alpha_next
         self.log_alpha = math.log(alpha_next)
         self.num_updates += 1
@@ -730,6 +817,13 @@ class NanochatMuonController:
             feedback_actual_decrease=feedback_actual_decrease,
             feedback_predicted_decrease=predicted_decrease,
             rho_star=rho_star,
+            feedback_observation_valid=feedback_observation_valid,
+            feedback_invalid_reason=feedback_invalid_reason,
+            startup_active=bool(startup_active),
+            startup_alpha_reference=startup_alpha_reference,
+            startup_log_term=startup_log_term,
+            startup_emergency=startup_emergency,
+            startup_monotone_clamped=startup_monotone_clamped,
         )
         self.last_stats = stats
         return stats

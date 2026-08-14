@@ -116,6 +116,14 @@ parser.add_argument("--control-alpha-init", type=float, default=-1.0, help="init
 parser.add_argument("--control-alpha-min", type=float, default=-1.0, help="minimum alpha; -1 uses 0.25 * alpha_init")
 parser.add_argument("--control-alpha-max", type=float, default=-1.0, help="maximum alpha; -1 uses 2.0 * alpha_init")
 parser.add_argument("--control-alpha-replay-file", type=str, default="", help="reserved absolute alpha replay source")
+parser.add_argument("--control-residual-validity-gate", action="store_true", help="reject low-observability Muon residual probes before rho EMA")
+parser.add_argument("--control-residual-min-muon-predicted-fraction", type=float, default=0.10, help="minimum predicted Muon fraction for residual feedback validity")
+parser.add_argument("--control-residual-max-adamw-predicted-fraction", type=float, default=0.90, help="maximum predicted AdamW fraction for residual feedback validity")
+parser.add_argument("--control-startup-alpha-reference-ratio", type=float, default=1.0, help="opt-in autonomous startup alpha target as a multiple of alpha init; 1 disables")
+parser.add_argument("--control-startup-alpha-reference-gain", type=float, default=0.5, help="startup alpha reference gain in log-alpha space")
+parser.add_argument("--control-startup-one-sided-safety", action="store_true", help="during autonomous startup, suppress non-emergency downward corrections")
+parser.add_argument("--control-startup-monotone", action="store_true", help="during autonomous startup, enforce a monotone alpha envelope")
+parser.add_argument("--control-startup-emergency-rho", type=float, default=-0.25, help="trusted rho below which startup safety may reduce alpha")
 parser.add_argument("--control-rho-star", type=float, default=0.7, help="target rho")
 parser.add_argument("--control-rho-reference", type=str, default="fixed", choices=["fixed", "loss_progress"], help="fixed rho target or loss-progress phased target")
 parser.add_argument("--control-rho-middle", type=float, default=None, help="middle-phase rho target for loss_progress reference")
@@ -237,6 +245,20 @@ if args.control_log_every <= 0:
     raise ValueError("--control-log-every must be positive")
 if args.local_log_every <= 0:
     raise ValueError("--local-log-every must be positive")
+if args.control_residual_validity_gate and args.control_feedback_scope != "muon_residual_proxy":
+    raise ValueError("--control-residual-validity-gate requires muon_residual_proxy feedback")
+if args.control_residual_min_muon_predicted_fraction < 0 or args.control_residual_min_muon_predicted_fraction > 1:
+    raise ValueError("--control-residual-min-muon-predicted-fraction must be in [0, 1]")
+if args.control_residual_max_adamw_predicted_fraction < 0 or args.control_residual_max_adamw_predicted_fraction > 1:
+    raise ValueError("--control-residual-max-adamw-predicted-fraction must be in [0, 1]")
+if args.control_startup_alpha_reference_ratio < 1:
+    raise ValueError("--control-startup-alpha-reference-ratio must be at least 1")
+if args.control_startup_alpha_reference_ratio > 1 and args.control_rho_reference != "loss_progress":
+    raise ValueError("startup alpha reference requires --control-rho-reference=loss_progress")
+if args.control_startup_alpha_reference_ratio > 1 and (args.control_alpha_warmup_steps != 0 or args.control_start_step not in {-1, 0}):
+    raise ValueError("startup alpha reference requires zero controller warmup and control-start-step=0")
+if (args.control_startup_one_sided_safety or args.control_startup_monotone) and args.control_startup_alpha_reference_ratio <= 1:
+    raise ValueError("startup safety options require an enabled startup alpha reference")
 if args.control_alpha_warmup_steps < 0:
     raise ValueError("--control-alpha-warmup-steps must be non-negative")
 if args.control_start_step < -1:
@@ -604,6 +626,11 @@ if controlled_muon_enabled:
         alignment_bad_step_shrink=args.control_alignment_bad_step_shrink,
         alignment_max_log_alpha_change=args.control_alignment_max_log_alpha_change,
         alignment_eps=args.control_alignment_eps,
+        startup_alpha_reference_ratio=args.control_startup_alpha_reference_ratio,
+        startup_alpha_reference_gain=args.control_startup_alpha_reference_gain,
+        startup_one_sided_safety=args.control_startup_one_sided_safety,
+        startup_monotone=args.control_startup_monotone,
+        startup_emergency_rho=args.control_startup_emergency_rho,
     )
     if not control_output_dir:
         control_output_dir = os.path.join(base_dir, "controlled_optimizer_outputs", output_dirname, args.optimizer_variant)
@@ -696,7 +723,8 @@ controller_csv_fields = [
     "muon_lr_max", "adamw_lr_min", "adamw_lr_max",
     "effective_muon_lr_min", "effective_muon_lr_max",
     "effective_muon_lr_mean", "rho", "rho_clipped", "rho_ema", "rho_control",
-    "rho_star_applied", "rho_reference_mode", "rho_phase_observation_count", "rho_phase_loss_fast",
+    "rho_star_applied", "rho_reference_mode",    "feedback_observation_valid", "feedback_invalid_reason", "startup_active", "startup_alpha_reference", "startup_log_term", "startup_emergency", "startup_monotone_clamped",
+ "rho_phase_observation_count", "rho_phase_loss_fast",
     "rho_phase_loss_slow", "rho_phase_relative_progress", "rho_phase_progress_reference",
     "rho_phase_progress_ratio", "rho_phase_candidate", "rho_phase",
     "loss_before_probe", "loss_after_probe", "actual_decrease",
@@ -1167,6 +1195,44 @@ while True:
                 total_update_norm=control_diagnostics["total_update_norm"],
                 muon_update_norm=control_diagnostics["muon_update_norm"],
             )
+            feedback_observation_valid = True
+            feedback_invalid_reason = None
+            if args.control_residual_validity_gate:
+                predicted_total = float(control_feedback.predicted_total)
+                predicted_muon = float(control_feedback.predicted_for_control)
+                actual_muon = float(control_feedback.actual_for_control)
+                if not math.isfinite(actual_muon):
+                    feedback_observation_valid = False
+                    feedback_invalid_reason = "residual_actual_nonfinite"
+                elif not math.isfinite(predicted_total) or predicted_total <= 0.0:
+                    feedback_observation_valid = False
+                    feedback_invalid_reason = "total_predicted_decrease_invalid"
+                elif not math.isfinite(predicted_muon) or predicted_muon <= 0.0:
+                    feedback_observation_valid = False
+                    feedback_invalid_reason = "muon_predicted_decrease_invalid"
+                else:
+                    raw_residual_rho = actual_muon / predicted_muon
+                    if (
+                        not math.isfinite(raw_residual_rho)
+                        or raw_residual_rho < args.control_rho_clip_min
+                        or raw_residual_rho > args.control_rho_clip_max
+                    ):
+                        feedback_observation_valid = False
+                        feedback_invalid_reason = "residual_rho_clipped"
+                    else:
+                        muon_fraction = predicted_muon / predicted_total
+                        adamw_fraction = 1.0 - muon_fraction
+                        if not math.isfinite(muon_fraction) or muon_fraction < args.control_residual_min_muon_predicted_fraction:
+                            feedback_observation_valid = False
+                            feedback_invalid_reason = "muon_predicted_fraction_too_small"
+                        elif not math.isfinite(adamw_fraction) or adamw_fraction > args.control_residual_max_adamw_predicted_fraction:
+                            feedback_observation_valid = False
+                            feedback_invalid_reason = "adamw_predicted_fraction_too_large"
+            startup_active = (
+                args.control_startup_alpha_reference_ratio > 1.0
+                and rho_reference is not None
+                and rho_reference.phase <= 0.0
+            )
             feedback_actual_override = (
                 None
                 if args.control_feedback_scope == "total"
@@ -1180,6 +1246,9 @@ while True:
                 grad_norm=control_feedback.grad_norm_for_control,
                 update_norm=control_feedback.update_norm_for_control,
                 feedback_actual_decrease=feedback_actual_override,
+                feedback_observation_valid=feedback_observation_valid,
+                feedback_invalid_reason=feedback_invalid_reason,
+                startup_active=startup_active,
                 rho_star_override=None if rho_reference is None else rho_reference.rho_star,
             )
     model.zero_grad(set_to_none=True)
@@ -1224,6 +1293,13 @@ while True:
             "rho_ema": control_stats.rho_ema,
             "rho_control": control_stats.rho_control,
             "rho_star_applied": control_stats.rho_star,
+            "feedback_observation_valid": int(control_stats.feedback_observation_valid),
+            "feedback_invalid_reason": control_stats.feedback_invalid_reason,
+            "startup_active": int(control_stats.startup_active),
+            "startup_alpha_reference": control_stats.startup_alpha_reference,
+            "startup_log_term": control_stats.startup_log_term,
+            "startup_emergency": int(control_stats.startup_emergency),
+            "startup_monotone_clamped": int(control_stats.startup_monotone_clamped),
             "rho_reference_mode": args.control_rho_reference,
             "rho_phase_observation_count": "" if rho_reference is None else rho_reference.observation_count,
             "rho_phase_loss_fast": "" if rho_reference is None else rho_reference.loss_fast,
