@@ -36,6 +36,7 @@ from nanochat.controlled_muon import (
     CONTROL_FEEDBACK_SCOPES,
     NanochatMuonController,
     LossProgressRhoReference,
+    ThreeStageLossProgressRhoReference,
     absolute_group_lr_scale,
     control_feedback_state_dict,
     select_control_feedback,
@@ -124,10 +125,21 @@ parser.add_argument("--control-startup-alpha-reference-gain", type=float, defaul
 parser.add_argument("--control-startup-one-sided-safety", action="store_true", help="during autonomous startup, suppress non-emergency downward corrections")
 parser.add_argument("--control-startup-monotone", action="store_true", help="during autonomous startup, enforce a monotone alpha envelope")
 parser.add_argument("--control-startup-emergency-rho", type=float, default=-0.25, help="trusted rho below which startup safety may reduce alpha")
+parser.add_argument("--control-startup-kp", type=float, default=-1.0, help="startup proportional gain for three-stage rho reference; -1 uses control-kp")
+parser.add_argument("--control-startup-factor-max", type=float, default=-1.0, help="startup factor ceiling for three-stage rho reference; -1 uses control-factor-max")
 parser.add_argument("--control-rho-star", type=float, default=0.7, help="target rho")
-parser.add_argument("--control-rho-reference", type=str, default="fixed", choices=["fixed", "loss_progress"], help="fixed rho target or loss-progress phased target")
+parser.add_argument("--control-rho-reference", type=str, default="fixed", choices=["fixed", "loss_progress", "loss_progress_three_stage"], help="fixed, two-stage, or three-stage loss-progress rho target")
+parser.add_argument("--control-rho-start", type=float, default=None, help="startup rho target for loss_progress_three_stage reference")
+parser.add_argument("--control-rho-cruise", type=float, default=None, help="cruise rho target for loss_progress_three_stage reference")
 parser.add_argument("--control-rho-middle", type=float, default=None, help="middle-phase rho target for loss_progress reference")
 parser.add_argument("--control-rho-late", type=float, default=None, help="late-phase rho target for loss_progress reference")
+parser.add_argument("--control-rho-startup-fast-beta", type=float, default=0.70, help="fast loss EMA beta for three-stage startup transition")
+parser.add_argument("--control-rho-startup-slow-beta", type=float, default=0.95, help="slow loss EMA beta for three-stage startup transition")
+parser.add_argument("--control-rho-startup-reference-beta", type=float, default=0.995, help="progress-reference beta for three-stage startup transition")
+parser.add_argument("--control-rho-startup-phase-beta", type=float, default=0.90, help="phase smoothing beta for three-stage startup transition")
+parser.add_argument("--control-rho-startup-ratio-high", type=float, default=0.80, help="progress ratio at startup phase zero")
+parser.add_argument("--control-rho-startup-ratio-low", type=float, default=0.40, help="progress ratio at startup phase one")
+parser.add_argument("--control-rho-startup-min-observations", type=int, default=10, help="loss observations required before startup phase can advance")
 parser.add_argument("--control-rho-progress-fast-beta", type=float, default=0.90, help="fast loss EMA beta for phased rho reference")
 parser.add_argument("--control-rho-progress-slow-beta", type=float, default=0.99, help="slow loss EMA beta for phased rho reference")
 parser.add_argument("--control-rho-progress-reference-beta", type=float, default=0.999, help="decay beta for observed progress scale")
@@ -211,14 +223,26 @@ if args.optimizer_variant in CONTROLLED_MUON_VARIANTS and not args.controlled_mu
 if args.controlled_muon and args.optimizer_variant not in CONTROLLED_MUON_VARIANTS:
     raise ValueError("--controlled-muon requires a controlled_muon_* optimizer variant")
 control_rho_middle = args.control_rho_star if args.control_rho_middle is None else args.control_rho_middle
+control_rho_cruise = control_rho_middle if args.control_rho_cruise is None else args.control_rho_cruise
 control_rho_late = args.control_rho_late
-if args.control_rho_reference == "loss_progress":
+if args.control_rho_reference in {"loss_progress", "loss_progress_three_stage"}:
     if args.optimizer_variant not in {"controlled_muon_raw", "controlled_muon_ema", "controlled_muon_ema_trust"}:
         raise ValueError("loss_progress rho reference is currently supported only for P controlled_muon variants")
     if control_rho_late is None:
         raise ValueError("loss_progress rho reference requires --control-rho-late")
     if args.control_alpha_warmup_steps != 0 or args.control_start_step not in {-1, 0}:
         raise ValueError("loss_progress rho reference requires zero controller alpha warmup and control-start-step=0")
+if args.control_rho_reference == "loss_progress_three_stage":
+    if args.control_rho_start is None:
+        raise ValueError("loss_progress_three_stage requires --control-rho-start")
+    if not args.control_rho_start < control_rho_cruise < control_rho_late:
+        raise ValueError("three-stage rho targets must satisfy start < cruise < late")
+    if args.control_startup_alpha_reference_ratio != 1.0:
+        raise ValueError("three-stage rho reference does not use a startup alpha reference")
+if args.control_startup_kp >= 0 and args.control_rho_reference != "loss_progress_three_stage":
+    raise ValueError("--control-startup-kp requires loss_progress_three_stage")
+if args.control_startup_factor_max >= 0 and args.control_rho_reference != "loss_progress_three_stage":
+    raise ValueError("--control-startup-factor-max requires loss_progress_three_stage")
 if args.control_alignment_aware and args.optimizer_variant not in CONTROLLED_MUON_VARIANTS:
     raise ValueError("--control-alignment-aware requires a controlled P/PI/PID Muon variant")
 if args.seed < 0:
@@ -585,6 +609,26 @@ if controlled_muon_enabled and args.control_rho_reference == "loss_progress":
         progress_ratio_low=args.control_rho_progress_ratio_low,
         minimum_observations=args.control_rho_progress_min_observations,
     )
+elif controlled_muon_enabled and args.control_rho_reference == "loss_progress_three_stage":
+    rho_reference = ThreeStageLossProgressRhoReference(
+        rho_start=args.control_rho_start,
+        rho_cruise=control_rho_cruise,
+        rho_late=control_rho_late,
+        startup_beta_fast=args.control_rho_startup_fast_beta,
+        startup_beta_slow=args.control_rho_startup_slow_beta,
+        startup_beta_reference=args.control_rho_startup_reference_beta,
+        startup_beta_phase=args.control_rho_startup_phase_beta,
+        startup_progress_ratio_high=args.control_rho_startup_ratio_high,
+        startup_progress_ratio_low=args.control_rho_startup_ratio_low,
+        startup_minimum_observations=args.control_rho_startup_min_observations,
+        late_beta_fast=args.control_rho_progress_fast_beta,
+        late_beta_slow=args.control_rho_progress_slow_beta,
+        late_beta_reference=args.control_rho_progress_reference_beta,
+        late_beta_phase=args.control_rho_phase_beta,
+        late_progress_ratio_high=args.control_rho_progress_ratio_high,
+        late_progress_ratio_low=args.control_rho_progress_ratio_low,
+        late_minimum_observations=args.control_rho_progress_min_observations,
+    )
 controller = None
 control_output_dir = args.control_output_dir
 if controlled_muon_enabled:
@@ -602,7 +646,7 @@ if controlled_muon_enabled:
         alpha_init=alpha_init,
         alpha_min=alpha_min,
         alpha_max=alpha_max,
-        rho_star=control_rho_middle if rho_reference is not None else args.control_rho_star,
+        rho_star=rho_reference.rho_star if rho_reference is not None else args.control_rho_star,
         kp=args.control_kp,
         ki=args.control_ki,
         kd=args.control_kd,
@@ -631,6 +675,12 @@ if controlled_muon_enabled:
         startup_one_sided_safety=args.control_startup_one_sided_safety,
         startup_monotone=args.control_startup_monotone,
         startup_emergency_rho=args.control_startup_emergency_rho,
+        startup_kp=args.control_startup_kp if args.control_startup_kp >= 0 else None,
+        startup_factor_max=(
+            args.control_startup_factor_max
+            if args.control_startup_factor_max >= 0
+            else None
+        ),
     )
     if not control_output_dir:
         control_output_dir = os.path.join(base_dir, "controlled_optimizer_outputs", output_dirname, args.optimizer_variant)
@@ -668,9 +718,9 @@ if controlled_muon_enabled:
         saved_reference_state = meta_data.get("loop_state", {}).get("controlled_muon_rho_reference")
         if rho_reference is None:
             if saved_reference_state is not None:
-                raise ValueError("dynamic rho reference checkpoint requires --control-rho-reference=loss_progress")
+                raise ValueError("dynamic rho reference checkpoint requires a loss-progress rho reference")
         elif saved_reference_state is None:
-            raise ValueError("loss_progress rho reference checkpoint state is missing")
+            raise ValueError("loss-progress rho reference checkpoint state is missing")
         else:
             rho_reference.load_state_dict(saved_reference_state)
         validate_resumed_control_feedback(
@@ -723,10 +773,16 @@ controller_csv_fields = [
     "muon_lr_max", "adamw_lr_min", "adamw_lr_max",
     "effective_muon_lr_min", "effective_muon_lr_max",
     "effective_muon_lr_mean", "rho", "rho_clipped", "rho_ema", "rho_control",
-    "rho_star_applied", "rho_reference_mode",    "feedback_observation_valid", "feedback_invalid_reason", "startup_active", "startup_alpha_reference", "startup_log_term", "startup_emergency", "startup_monotone_clamped",
- "rho_phase_observation_count", "rho_phase_loss_fast",
+    "rho_star_applied", "rho_reference_mode",
+    "feedback_observation_valid", "feedback_invalid_reason",
+    "startup_active", "startup_alpha_reference", "startup_log_term",
+    "startup_emergency", "startup_monotone_clamped", "startup_weight",
+    "kp_applied", "factor_max_applied",
+    "rho_phase_observation_count", "rho_phase_loss_fast",
     "rho_phase_loss_slow", "rho_phase_relative_progress", "rho_phase_progress_reference",
     "rho_phase_progress_ratio", "rho_phase_candidate", "rho_phase",
+    "rho_startup_phase", "rho_startup_weight", "rho_startup_progress_ratio",
+    "rho_startup_phase_candidate", "rho_late_phase",
     "loss_before_probe", "loss_after_probe", "actual_decrease",
     "feedback_actual_decrease", "feedback_predicted_decrease",
     "rho_total", "rho_muon_residual_proxy", "adamw_predicted_fraction",
@@ -1233,6 +1289,7 @@ while True:
                 and rho_reference is not None
                 and rho_reference.phase <= 0.0
             )
+            startup_weight = float(getattr(rho_reference, "startup_weight", 0.0))
             feedback_actual_override = (
                 None
                 if args.control_feedback_scope == "total"
@@ -1249,6 +1306,7 @@ while True:
                 feedback_observation_valid=feedback_observation_valid,
                 feedback_invalid_reason=feedback_invalid_reason,
                 startup_active=startup_active,
+                startup_weight=startup_weight,
                 rho_star_override=None if rho_reference is None else rho_reference.rho_star,
             )
     model.zero_grad(set_to_none=True)
@@ -1300,6 +1358,9 @@ while True:
             "startup_log_term": control_stats.startup_log_term,
             "startup_emergency": int(control_stats.startup_emergency),
             "startup_monotone_clamped": int(control_stats.startup_monotone_clamped),
+            "startup_weight": control_stats.startup_weight,
+            "kp_applied": control_stats.kp_applied,
+            "factor_max_applied": control_stats.factor_max_applied,
             "rho_reference_mode": args.control_rho_reference,
             "rho_phase_observation_count": "" if rho_reference is None else rho_reference.observation_count,
             "rho_phase_loss_fast": "" if rho_reference is None else rho_reference.loss_fast,
@@ -1309,6 +1370,11 @@ while True:
             "rho_phase_progress_ratio": "" if rho_reference is None else rho_reference.progress_ratio,
             "rho_phase_candidate": "" if rho_reference is None else rho_reference.phase_candidate,
             "rho_phase": "" if rho_reference is None else rho_reference.phase,
+            "rho_startup_phase": "" if rho_reference is None else getattr(rho_reference, "startup_phase", ""),
+            "rho_startup_weight": "" if rho_reference is None else getattr(rho_reference, "startup_weight", ""),
+            "rho_startup_progress_ratio": "" if rho_reference is None else getattr(getattr(rho_reference, "startup_reference", None), "progress_ratio", ""),
+            "rho_startup_phase_candidate": "" if rho_reference is None else getattr(getattr(rho_reference, "startup_reference", None), "phase_candidate", ""),
+            "rho_late_phase": "" if rho_reference is None else getattr(rho_reference, "late_phase", rho_reference.phase),
             "loss_before_probe": control_stats.loss_before,
             "loss_after_probe": control_stats.loss_after,
             "actual_decrease": control_stats.actual_decrease,

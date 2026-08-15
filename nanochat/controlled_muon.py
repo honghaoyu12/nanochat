@@ -212,6 +212,9 @@ class NanochatMuonControlStats:
     startup_log_term: float = 0.0
     startup_emergency: bool = False
     startup_monotone_clamped: bool = False
+    startup_weight: float = 0.0
+    kp_applied: float = 0.0
+    factor_max_applied: float = 0.0
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -279,6 +282,8 @@ class NanochatMuonController:
         startup_one_sided_safety: bool = False,
         startup_monotone: bool = False,
         startup_emergency_rho: float = -0.25,
+        startup_kp: float | None = None,
+        startup_factor_max: float | None = None,
     ) -> None:
         if variant not in self.VALID_VARIANTS:
             raise ValueError(f"unknown controlled Muon variant: {variant}")
@@ -316,6 +321,12 @@ class NanochatMuonController:
             raise ValueError("startup alpha reference gain must be finite and positive")
         if not math.isfinite(startup_emergency_rho):
             raise ValueError("startup emergency rho must be finite")
+        startup_kp = kp if startup_kp is None else float(startup_kp)
+        startup_factor_max = factor_max if startup_factor_max is None else float(startup_factor_max)
+        if not math.isfinite(startup_kp) or startup_kp < 0.0:
+            raise ValueError("startup kp must be finite and non-negative")
+        if not math.isfinite(startup_factor_max) or startup_factor_max < factor_min:
+            raise ValueError("startup factor max must be finite and at least factor_min")
 
         self.variant = variant
         self.controller_family = self._parse_family(variant)
@@ -360,6 +371,8 @@ class NanochatMuonController:
         self.startup_one_sided_safety = bool(startup_one_sided_safety)
         self.startup_monotone = bool(startup_monotone)
         self.startup_emergency_rho = float(startup_emergency_rho)
+        self.startup_kp = startup_kp
+        self.startup_factor_max = startup_factor_max
 
         self.use_rho_ema = variant.endswith("_ema") or variant.endswith("_ema_trust")
         self.use_trust_region = variant.endswith("_ema_trust")
@@ -419,6 +432,8 @@ class NanochatMuonController:
             "startup_one_sided_safety": self.startup_one_sided_safety,
             "startup_monotone": self.startup_monotone,
             "startup_emergency_rho": self.startup_emergency_rho,
+            "startup_kp": self.startup_kp,
+            "startup_factor_max": self.startup_factor_max,
             "rho_ema": self.rho_ema,
             "integral_state": self.integral_state,
             "derivative_state": self.derivative_state,
@@ -464,6 +479,8 @@ class NanochatMuonController:
             "startup_alpha_reference_ratio",
             "startup_alpha_reference_gain",
             "startup_emergency_rho",
+            "startup_kp",
+            "startup_factor_max",
         ):
             if name in state:
                 setattr(self, name, float(state[name]))
@@ -509,6 +526,7 @@ class NanochatMuonController:
         error: float,
         valid: bool,
         freeze_positive_integral: bool = False,
+        kp_override: float | None = None,
     ) -> tuple[float, float, float, float, float]:
         if not valid:
             self.integral_state = 0.0
@@ -531,7 +549,8 @@ class NanochatMuonController:
         else:
             self.derivative_state = 0.0
         self.prev_error = error
-        p_term = self.kp * error
+        kp_applied = self.kp if kp_override is None else float(kp_override)
+        p_term = kp_applied * error
         i_term = self.ki * self.integral_state if self.controller_family in {"pi", "pid"} else 0.0
         d_term = self.kd * self.derivative_state if self.controller_family == "pid" else 0.0
         log_factor = p_term + i_term + d_term
@@ -550,6 +569,7 @@ class NanochatMuonController:
         feedback_observation_valid: bool = True,
         feedback_invalid_reason: str | None = None,
         startup_active: bool = False,
+        startup_weight: float = 0.0,
         freeze_positive_integral: bool = False,
         rho_star_override: float | None = None,
     ) -> NanochatMuonControlStats:
@@ -573,6 +593,7 @@ class NanochatMuonController:
             feedback_observation_valid=feedback_observation_valid,
             feedback_invalid_reason=feedback_invalid_reason,
             startup_active=startup_active,
+            startup_weight=startup_weight,
             freeze_positive_integral=freeze_positive_integral,
             rho_star_override=rho_star_override,
         )
@@ -591,6 +612,7 @@ class NanochatMuonController:
         feedback_observation_valid: bool = True,
         feedback_invalid_reason: str | None = None,
         startup_active: bool = False,
+        startup_weight: float = 0.0,
         freeze_positive_integral: bool = False,
         rho_star_override: float | None = None,
     ) -> NanochatMuonControlStats:
@@ -687,11 +709,18 @@ class NanochatMuonController:
         rho_star = self.rho_star if rho_star_override is None else float(rho_star_override)
         if not math.isfinite(rho_star):
             raise ValueError("rho_star_override must be finite")
+        startup_weight = _clip(float(startup_weight), 0.0, 1.0)
+        kp_applied = self.kp + startup_weight * (self.startup_kp - self.kp)
+        factor_max_applied = math.exp(
+            math.log(self.factor_max)
+            + startup_weight * (math.log(self.startup_factor_max) - math.log(self.factor_max))
+        )
         error = rho_control - rho_star
         p_term, i_term, d_term, control_log_factor, derivative_state = self._compute_pid_terms(
             error,
             measurement_for_control_is_valid,
             freeze_positive_integral=freeze_positive_integral,
+            kp_override=kp_applied,
         )
         alignment_penalty_term = 0.0
         if self.alignment_aware and measurement_for_control_is_valid and alignment_c is not None:
@@ -726,7 +755,7 @@ class NanochatMuonController:
                 if startup_alpha_reference is not None and alpha_used < startup_alpha_reference:
                     control_log_factor = max(control_log_factor, math.log(self.factor_max))
         raw_factor = math.exp(control_log_factor)
-        factor = _clip(raw_factor, self.factor_min, self.factor_max)
+        factor = _clip(raw_factor, self.factor_min, factor_max_applied)
         if alignment_bad_step:
             factor = self.alignment_bad_step_shrink
         elif not measurement_for_control_is_valid and not (
@@ -755,7 +784,7 @@ class NanochatMuonController:
             factor = max(factor, self.trust_region_expand_factor)
             factor = min(factor, self.trust_region_max_factor)
 
-        hard_factor_max = self.factor_max
+        hard_factor_max = factor_max_applied
         if self.use_trust_region:
             hard_factor_max = max(hard_factor_max, self.trust_region_max_factor)
         factor_lower = self.factor_min if measurement_for_control_is_valid else min(self.factor_min, 1.0)
@@ -824,6 +853,9 @@ class NanochatMuonController:
             startup_log_term=startup_log_term,
             startup_emergency=startup_emergency,
             startup_monotone_clamped=startup_monotone_clamped,
+            startup_weight=startup_weight,
+            kp_applied=kp_applied,
+            factor_max_applied=factor_max_applied,
         )
         self.last_stats = stats
         return stats
@@ -1047,3 +1079,153 @@ class LossProgressRhoReference:
             "rho_phase_candidate": self.phase_candidate,
             "rho_phase": self.phase,
         }
+
+
+class ThreeStageLossProgressRhoReference:
+    """Horizon-free startup, cruise, and late rho reference."""
+
+    SCHEMA_VERSION = 1
+
+    def __init__(
+        self,
+        *,
+        rho_start: float,
+        rho_cruise: float,
+        rho_late: float,
+        startup_beta_fast: float = 0.70,
+        startup_beta_slow: float = 0.95,
+        startup_beta_reference: float = 0.995,
+        startup_beta_phase: float = 0.90,
+        startup_progress_ratio_high: float = 0.80,
+        startup_progress_ratio_low: float = 0.40,
+        startup_minimum_observations: int = 10,
+        late_beta_fast: float = 0.98,
+        late_beta_slow: float = 0.998,
+        late_beta_reference: float = 0.9995,
+        late_beta_phase: float = 0.99,
+        late_progress_ratio_high: float = 0.65,
+        late_progress_ratio_low: float = 0.15,
+        late_minimum_observations: int = 50,
+    ) -> None:
+        if not all(math.isfinite(float(value)) for value in (rho_start, rho_cruise, rho_late)):
+            raise ValueError("three-stage rho targets must be finite")
+        if not rho_start < rho_cruise < rho_late:
+            raise ValueError("three-stage rho targets must satisfy start < cruise < late")
+        self.rho_start = float(rho_start)
+        self.rho_cruise = float(rho_cruise)
+        self.rho_late = float(rho_late)
+        self.startup_reference = LossProgressRhoReference(
+            rho_middle=0.0,
+            rho_late=1.0,
+            beta_fast=startup_beta_fast,
+            beta_slow=startup_beta_slow,
+            beta_reference=startup_beta_reference,
+            beta_phase=startup_beta_phase,
+            progress_ratio_high=startup_progress_ratio_high,
+            progress_ratio_low=startup_progress_ratio_low,
+            minimum_observations=startup_minimum_observations,
+        )
+        self.late_reference = LossProgressRhoReference(
+            rho_middle=0.0,
+            rho_late=1.0,
+            beta_fast=late_beta_fast,
+            beta_slow=late_beta_slow,
+            beta_reference=late_beta_reference,
+            beta_phase=late_beta_phase,
+            progress_ratio_high=late_progress_ratio_high,
+            progress_ratio_low=late_progress_ratio_low,
+            minimum_observations=late_minimum_observations,
+        )
+        self.startup_phase = 0.0
+        self.startup_weight = 1.0
+        self.late_phase = 0.0
+        self.rho_star = self.rho_start
+
+    @property
+    def observation_count(self) -> int:
+        return self.late_reference.observation_count
+
+    @property
+    def loss_fast(self) -> float | None:
+        return self.late_reference.loss_fast
+
+    @property
+    def loss_slow(self) -> float | None:
+        return self.late_reference.loss_slow
+
+    @property
+    def relative_progress(self) -> float:
+        return self.late_reference.relative_progress
+
+    @property
+    def progress_reference(self) -> float:
+        return self.late_reference.progress_reference
+
+    @property
+    def progress_ratio(self) -> float:
+        return self.late_reference.progress_ratio
+
+    @property
+    def phase_candidate(self) -> float:
+        return self.late_reference.phase_candidate
+
+    @property
+    def phase(self) -> float:
+        return self.late_phase
+
+    def observe(self, loss: float) -> float:
+        self.startup_reference.observe(loss)
+        self.late_reference.observe(loss)
+        self.startup_phase = self.startup_reference.phase
+        self.startup_weight = 1.0 - self.startup_phase
+        self.late_phase = self.late_reference.phase
+        self.rho_star = (
+            self.rho_start
+            + self.startup_phase * (self.rho_cruise - self.rho_start)
+            + self.late_phase * (self.rho_late - self.rho_cruise)
+        )
+        return self.rho_star
+
+    def state_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.SCHEMA_VERSION,
+            "rho_start": self.rho_start,
+            "rho_cruise": self.rho_cruise,
+            "rho_late": self.rho_late,
+            "startup_reference": self.startup_reference.state_dict(),
+            "late_reference": self.late_reference.state_dict(),
+            "startup_phase": self.startup_phase,
+            "startup_weight": self.startup_weight,
+            "late_phase": self.late_phase,
+            "rho_star": self.rho_star,
+        }
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        if int(state.get("schema_version", 1)) != self.SCHEMA_VERSION:
+            raise ValueError("unsupported three-stage rho reference schema")
+        for name in ("rho_start", "rho_cruise", "rho_late"):
+            if not math.isclose(float(state[name]), getattr(self, name), rel_tol=1e-12, abs_tol=1e-12):
+                raise ValueError(f"three-stage rho reference configuration mismatch: {name}")
+        self.startup_reference.load_state_dict(state["startup_reference"])
+        self.late_reference.load_state_dict(state["late_reference"])
+        self.startup_phase = _clip(float(state.get("startup_phase", self.startup_reference.phase)), 0.0, 1.0)
+        self.startup_weight = _clip(float(state.get("startup_weight", 1.0 - self.startup_phase)), 0.0, 1.0)
+        self.late_phase = _clip(float(state.get("late_phase", self.late_reference.phase)), 0.0, 1.0)
+        self.rho_star = float(state.get("rho_star", self.rho_start))
+        if not math.isfinite(self.rho_star):
+            raise ValueError("three-stage rho reference state contains nonfinite rho_star")
+
+    def diagnostics_dict(self) -> dict[str, Any]:
+        diagnostics = self.late_reference.diagnostics_dict()
+        diagnostics.update(
+            {
+                "rho_reference_mode": "loss_progress_three_stage",
+                "rho_star_applied": self.rho_star,
+                "rho_startup_phase": self.startup_phase,
+                "rho_startup_weight": self.startup_weight,
+                "rho_startup_progress_ratio": self.startup_reference.progress_ratio,
+                "rho_startup_phase_candidate": self.startup_reference.phase_candidate,
+                "rho_late_phase": self.late_phase,
+            }
+        )
+        return diagnostics
