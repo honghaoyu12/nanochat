@@ -140,6 +140,7 @@ def test_startup_gain_interpolates_without_changing_legacy_defaults():
         factor_max=1.02,
         startup_kp=0.1,
         startup_factor_max=1.02,
+        action_policy="legacy",
     )
     startup = NanochatMuonController(
         variant="controlled_muon_ema",
@@ -167,6 +168,190 @@ def test_startup_gain_interpolates_without_changing_legacy_defaults():
     assert startup_stats.kp_applied == pytest.approx(0.5)
     assert startup_stats.factor_max_applied == pytest.approx(1.08)
     assert startup_stats.alpha_next == pytest.approx(1.08)
+
+
+def _phase_hold_controller(**overrides):
+    kwargs = {
+        "variant": "controlled_muon_ema",
+        "alpha_init": 1.0,
+        "alpha_min": 0.25,
+        "alpha_max": 2.0,
+        "rho_star": 0.55,
+        "kp": 0.03,
+        "rho_beta": 0.0,
+        "factor_min": 0.5,
+        "factor_max": 2.0,
+        "startup_kp": 0.5,
+        "startup_factor_max": 2.0,
+        "action_policy": "phase_hold",
+        "phase_hold_cruise_policy": "hold",
+        "phase_hold_start_rho": 0.25,
+        "phase_hold_cruise_rho": 0.55,
+        "phase_hold_cruise_kp": 0.0,
+        "phase_hold_cruise_deadband": 0.05,
+        "phase_hold_late_rho": 0.90,
+        "phase_hold_late_kp": 0.03,
+        "phase_hold_late_exponent": 2.0,
+    }
+    kwargs.update(overrides)
+    return NanochatMuonController(**kwargs)
+
+
+def test_legacy_policy_ignores_phase_hold_only_parameters():
+    controller = NanochatMuonController(
+        variant="controlled_muon_ema",
+        alpha_init=1.0,
+        alpha_min=0.5,
+        alpha_max=1.5,
+        rho_star=0.96,
+        kp=0.04,
+        factor_min=0.98,
+        factor_max=1.02,
+        action_policy="legacy",
+        phase_hold_start_rho=0.91,
+        phase_hold_cruise_rho=0.91,
+        phase_hold_late_rho=0.96,
+    )
+
+    assert controller.action_policy == "legacy"
+
+
+def test_phase_hold_policy_rejects_non_increasing_rho_targets():
+    with pytest.raises(ValueError, match="start < cruise < late"):
+        _phase_hold_controller(
+            phase_hold_start_rho=0.55,
+            phase_hold_cruise_rho=0.55,
+        )
+
+
+def test_phase_hold_startup_cruise_and_late_actions_are_one_sided():
+    controller = _phase_hold_controller()
+    startup = controller.update(
+        step=0,
+        loss_before=1.0,
+        loss_after=0.5,
+        predicted_decrease=0.5,
+        startup_weight=1.0,
+        late_phase=0.0,
+    )
+    assert startup.phase_start_weight == pytest.approx(1.0)
+    assert startup.phase_start_action > 0.0
+    assert startup.phase_cruise_action == pytest.approx(0.0)
+    assert startup.phase_late_action == pytest.approx(0.0)
+
+    cruise = controller.update(
+        step=1,
+        loss_before=1.0,
+        loss_after=0.5,
+        predicted_decrease=0.5,
+        startup_weight=0.0,
+        late_phase=0.0,
+    )
+    assert cruise.phase_cruise_weight == pytest.approx(1.0)
+    assert cruise.control_log_factor == pytest.approx(0.0)
+    assert cruise.alpha_next == pytest.approx(cruise.alpha)
+
+    late = controller.update(
+        step=2,
+        loss_before=1.0,
+        loss_after=0.75,
+        predicted_decrease=0.5,
+        startup_weight=0.0,
+        late_phase=0.5,
+    )
+    assert late.phase_late_weight == pytest.approx(0.25)
+    assert late.phase_late_action < 0.0
+    assert late.control_log_factor == pytest.approx(
+        late.phase_late_weight * late.phase_late_action
+    )
+    assert late.alpha_next < late.alpha
+
+    no_late_increase = controller.update(
+        step=3,
+        loss_before=1.0,
+        loss_after=0.5,
+        predicted_decrease=0.5,
+        startup_weight=0.0,
+        late_phase=1.0,
+    )
+    assert no_late_increase.phase_late_action == pytest.approx(0.0)
+    assert no_late_increase.alpha_next == pytest.approx(no_late_increase.alpha)
+
+
+def test_phase_hold_late_exponent_delays_authority_and_weights_sum_to_one():
+    q2 = _phase_hold_controller(phase_hold_late_exponent=2.0)
+    q4 = _phase_hold_controller(phase_hold_late_exponent=4.0)
+    kwargs = {
+        "step": 0,
+        "loss_before": 1.0,
+        "loss_after": 0.75,
+        "predicted_decrease": 0.5,
+        "startup_weight": 0.0,
+        "late_phase": 0.5,
+    }
+    q2_stats = q2.update(**kwargs)
+    q4_stats = q4.update(**kwargs)
+    assert q4_stats.phase_late_weight < q2_stats.phase_late_weight
+    assert abs(q4_stats.control_log_factor) < abs(q2_stats.control_log_factor)
+    for stats in (q2_stats, q4_stats):
+        assert (
+            stats.phase_start_weight
+            + stats.phase_cruise_weight
+            + stats.phase_late_weight
+        ) == pytest.approx(1.0)
+
+
+def test_phase_hold_deadband_invalid_feedback_and_state_roundtrip():
+    controller = _phase_hold_controller(
+        phase_hold_cruise_policy="rho_deadband",
+        phase_hold_cruise_kp=0.003,
+    )
+    inside = controller.update(
+        step=0,
+        loss_before=1.0,
+        loss_after=0.71,
+        predicted_decrease=0.5,
+        startup_weight=0.0,
+        late_phase=0.0,
+    )
+    assert inside.phase_cruise_deadband_active
+    assert inside.phase_cruise_action == pytest.approx(0.0)
+
+    outside = controller.update(
+        step=1,
+        loss_before=1.0,
+        loss_after=0.65,
+        predicted_decrease=0.5,
+        startup_weight=0.0,
+        late_phase=0.0,
+    )
+    assert not outside.phase_cruise_deadband_active
+    assert outside.phase_cruise_action > 0.0
+
+    frozen = controller.update(
+        step=2,
+        loss_before=1.0,
+        loss_after=0.5,
+        predicted_decrease=0.5,
+        feedback_observation_valid=False,
+        feedback_invalid_reason="test_invalid",
+        startup_weight=0.0,
+        late_phase=1.0,
+    )
+    assert frozen.control_log_factor == pytest.approx(0.0)
+    assert frozen.alpha_next == pytest.approx(frozen.alpha)
+
+    restored = _phase_hold_controller(
+        phase_hold_cruise_policy="rho_deadband",
+        phase_hold_cruise_kp=0.003,
+    )
+    restored.load_state_dict(controller.state_dict())
+    assert restored.alpha == pytest.approx(controller.alpha)
+    assert restored.action_policy == "phase_hold"
+    assert restored.last_stats is not None
+    assert restored.last_stats.phase_late_weight == pytest.approx(
+        controller.last_stats.phase_late_weight
+    )
 
 
 def test_three_stage_reference_moves_startup_then_late_and_roundtrips():

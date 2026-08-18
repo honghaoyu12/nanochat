@@ -17,7 +17,14 @@ def _clip(value: float, lower: float, upper: float) -> float:
 
 ABSOLUTE_GROUP_SCALING_MODES = {"uniform", "initial_lr_ratio"}
 CONTROL_FEEDBACK_SCOPES = {"total", "muon_residual_proxy"}
+CONTROL_ACTION_POLICIES = {"legacy", "phase_hold"}
+PHASE_HOLD_CRUISE_POLICIES = {"hold", "rho_deadband"}
 CONTROL_FEEDBACK_STATE_SCHEMA_VERSION = 1
+
+
+def _deadband(value: float, width: float) -> float:
+    magnitude = max(0.0, abs(value) - width)
+    return math.copysign(magnitude, value) if magnitude > 0.0 else 0.0
 
 
 @dataclass(frozen=True)
@@ -215,6 +222,15 @@ class NanochatMuonControlStats:
     startup_weight: float = 0.0
     kp_applied: float = 0.0
     factor_max_applied: float = 0.0
+    action_policy: str = "legacy"
+    phase_start_weight: float = 0.0
+    phase_cruise_weight: float = 0.0
+    phase_late_weight: float = 0.0
+    phase_start_action: float = 0.0
+    phase_cruise_action: float = 0.0
+    phase_late_action: float = 0.0
+    phase_cruise_deadband_active: bool = False
+    phase_late_exponent: float = 1.0
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -284,6 +300,15 @@ class NanochatMuonController:
         startup_emergency_rho: float = -0.25,
         startup_kp: float | None = None,
         startup_factor_max: float | None = None,
+        action_policy: str = "legacy",
+        phase_hold_cruise_policy: str = "hold",
+        phase_hold_start_rho: float = 0.25,
+        phase_hold_cruise_rho: float = 0.55,
+        phase_hold_cruise_kp: float = 0.0,
+        phase_hold_cruise_deadband: float = 0.05,
+        phase_hold_late_rho: float = 0.90,
+        phase_hold_late_kp: float = 0.03,
+        phase_hold_late_exponent: float = 2.0,
     ) -> None:
         if variant not in self.VALID_VARIANTS:
             raise ValueError(f"unknown controlled Muon variant: {variant}")
@@ -327,6 +352,34 @@ class NanochatMuonController:
             raise ValueError("startup kp must be finite and non-negative")
         if not math.isfinite(startup_factor_max) or startup_factor_max < factor_min:
             raise ValueError("startup factor max must be finite and at least factor_min")
+        if action_policy not in CONTROL_ACTION_POLICIES:
+            raise ValueError(f"unknown control action policy: {action_policy}")
+        if action_policy == "phase_hold":
+            if phase_hold_cruise_policy not in PHASE_HOLD_CRUISE_POLICIES:
+                raise ValueError(f"unknown phase-hold cruise policy: {phase_hold_cruise_policy}")
+            phase_values = (
+                phase_hold_start_rho,
+                phase_hold_cruise_rho,
+                phase_hold_cruise_kp,
+                phase_hold_cruise_deadband,
+                phase_hold_late_rho,
+                phase_hold_late_kp,
+                phase_hold_late_exponent,
+            )
+            if not all(math.isfinite(float(value)) for value in phase_values):
+                raise ValueError("phase-hold parameters must be finite")
+            if not phase_hold_start_rho < phase_hold_cruise_rho < phase_hold_late_rho:
+                raise ValueError("phase-hold rho targets must satisfy start < cruise < late")
+            if phase_hold_cruise_kp < 0.0 or phase_hold_late_kp < 0.0:
+                raise ValueError("phase-hold gains must be non-negative")
+            if phase_hold_cruise_deadband < 0.0:
+                raise ValueError("phase-hold cruise deadband must be non-negative")
+            if phase_hold_late_exponent < 1.0:
+                raise ValueError("phase-hold late exponent must be at least 1")
+            if phase_hold_cruise_policy == "hold" and phase_hold_cruise_kp != 0.0:
+                raise ValueError("phase-hold exact cruise requires zero cruise gain")
+            if phase_hold_cruise_policy == "rho_deadband" and phase_hold_cruise_kp <= 0.0:
+                raise ValueError("phase-hold rho deadband requires positive cruise gain")
 
         self.variant = variant
         self.controller_family = self._parse_family(variant)
@@ -373,6 +426,15 @@ class NanochatMuonController:
         self.startup_emergency_rho = float(startup_emergency_rho)
         self.startup_kp = startup_kp
         self.startup_factor_max = startup_factor_max
+        self.action_policy = action_policy
+        self.phase_hold_cruise_policy = phase_hold_cruise_policy
+        self.phase_hold_start_rho = float(phase_hold_start_rho)
+        self.phase_hold_cruise_rho = float(phase_hold_cruise_rho)
+        self.phase_hold_cruise_kp = float(phase_hold_cruise_kp)
+        self.phase_hold_cruise_deadband = float(phase_hold_cruise_deadband)
+        self.phase_hold_late_rho = float(phase_hold_late_rho)
+        self.phase_hold_late_kp = float(phase_hold_late_kp)
+        self.phase_hold_late_exponent = float(phase_hold_late_exponent)
 
         self.use_rho_ema = variant.endswith("_ema") or variant.endswith("_ema_trust")
         self.use_trust_region = variant.endswith("_ema_trust")
@@ -434,6 +496,15 @@ class NanochatMuonController:
             "startup_emergency_rho": self.startup_emergency_rho,
             "startup_kp": self.startup_kp,
             "startup_factor_max": self.startup_factor_max,
+            "action_policy": self.action_policy,
+            "phase_hold_cruise_policy": self.phase_hold_cruise_policy,
+            "phase_hold_start_rho": self.phase_hold_start_rho,
+            "phase_hold_cruise_rho": self.phase_hold_cruise_rho,
+            "phase_hold_cruise_kp": self.phase_hold_cruise_kp,
+            "phase_hold_cruise_deadband": self.phase_hold_cruise_deadband,
+            "phase_hold_late_rho": self.phase_hold_late_rho,
+            "phase_hold_late_kp": self.phase_hold_late_kp,
+            "phase_hold_late_exponent": self.phase_hold_late_exponent,
             "rho_ema": self.rho_ema,
             "integral_state": self.integral_state,
             "derivative_state": self.derivative_state,
@@ -447,6 +518,27 @@ class NanochatMuonController:
         saved_variant = state.get("variant", self.variant)
         if saved_variant != self.variant:
             raise ValueError(f"cannot load {saved_variant} controller state into {self.variant}")
+        saved_action_policy = state.get("action_policy", "legacy")
+        if saved_action_policy != self.action_policy:
+            raise ValueError(
+                f"cannot load {saved_action_policy} action policy with {self.action_policy} configured"
+            )
+        saved_cruise_policy = state.get("phase_hold_cruise_policy", "hold")
+        if self.action_policy == "phase_hold" and saved_cruise_policy != self.phase_hold_cruise_policy:
+            raise ValueError("cannot load controller state with different phase-hold cruise policy")
+        for name in (
+            "phase_hold_start_rho",
+            "phase_hold_cruise_rho",
+            "phase_hold_cruise_kp",
+            "phase_hold_cruise_deadband",
+            "phase_hold_late_rho",
+            "phase_hold_late_kp",
+            "phase_hold_late_exponent",
+        ):
+            if self.action_policy == "phase_hold" and not math.isclose(
+                float(state[name]), getattr(self, name), rel_tol=1e-12, abs_tol=1e-12
+            ):
+                raise ValueError(f"phase-hold controller configuration mismatch: {name}")
 
         for name in (
             "alpha_min",
@@ -570,6 +662,7 @@ class NanochatMuonController:
         feedback_invalid_reason: str | None = None,
         startup_active: bool = False,
         startup_weight: float = 0.0,
+        late_phase: float = 0.0,
         freeze_positive_integral: bool = False,
         rho_star_override: float | None = None,
     ) -> NanochatMuonControlStats:
@@ -594,6 +687,7 @@ class NanochatMuonController:
             feedback_invalid_reason=feedback_invalid_reason,
             startup_active=startup_active,
             startup_weight=startup_weight,
+            late_phase=late_phase,
             freeze_positive_integral=freeze_positive_integral,
             rho_star_override=rho_star_override,
         )
@@ -613,6 +707,7 @@ class NanochatMuonController:
         feedback_invalid_reason: str | None = None,
         startup_active: bool = False,
         startup_weight: float = 0.0,
+        late_phase: float = 0.0,
         freeze_positive_integral: bool = False,
         rho_star_override: float | None = None,
     ) -> NanochatMuonControlStats:
@@ -710,18 +805,79 @@ class NanochatMuonController:
         if not math.isfinite(rho_star):
             raise ValueError("rho_star_override must be finite")
         startup_weight = _clip(float(startup_weight), 0.0, 1.0)
+        late_phase = _clip(float(late_phase), 0.0, 1.0)
+        startup_phase = 1.0 - startup_weight
+        late_authority = late_phase ** self.phase_hold_late_exponent
+        phase_start_weight = startup_weight
+        phase_cruise_weight = startup_phase * (1.0 - late_authority)
+        phase_late_weight = startup_phase * late_authority
         kp_applied = self.kp + startup_weight * (self.startup_kp - self.kp)
         factor_max_applied = math.exp(
             math.log(self.factor_max)
             + startup_weight * (math.log(self.startup_factor_max) - math.log(self.factor_max))
         )
-        error = rho_control - rho_star
-        p_term, i_term, d_term, control_log_factor, derivative_state = self._compute_pid_terms(
-            error,
-            measurement_for_control_is_valid,
-            freeze_positive_integral=freeze_positive_integral,
-            kp_override=kp_applied,
+        phase_start_action = 0.0
+        phase_cruise_action = 0.0
+        phase_late_action = 0.0
+        phase_cruise_deadband_active = False
+        phase_hold_startup_emergency = (
+            measurement_for_control_is_valid
+            and rho_control <= self.startup_emergency_rho
         )
+        if self.action_policy == "phase_hold":
+            rho_star = (
+                phase_start_weight * self.phase_hold_start_rho
+                + phase_cruise_weight * self.phase_hold_cruise_rho
+                + phase_late_weight * self.phase_hold_late_rho
+            )
+            error = rho_control - rho_star
+            if measurement_for_control_is_valid:
+                raw_start_action = self.startup_kp * (
+                    rho_control - self.phase_hold_start_rho
+                )
+                phase_start_action = (
+                    raw_start_action
+                    if phase_hold_startup_emergency
+                    else max(raw_start_action, 0.0)
+                )
+                cruise_error = rho_control - self.phase_hold_cruise_rho
+                phase_cruise_deadband_active = (
+                    abs(cruise_error) <= self.phase_hold_cruise_deadband
+                )
+                if self.phase_hold_cruise_policy == "rho_deadband":
+                    phase_cruise_action = self.phase_hold_cruise_kp * _deadband(
+                        cruise_error, self.phase_hold_cruise_deadband
+                    )
+                phase_late_action = min(
+                    self.phase_hold_late_kp
+                    * (rho_control - self.phase_hold_late_rho),
+                    0.0,
+                )
+            control_log_factor = (
+                phase_start_weight * phase_start_action
+                + phase_cruise_weight * phase_cruise_action
+                + phase_late_weight * phase_late_action
+            )
+            p_term = control_log_factor
+            i_term = 0.0
+            d_term = 0.0
+            self.integral_state = 0.0
+            self.derivative_state = 0.0
+            self.prev_error = error if measurement_for_control_is_valid else None
+            derivative_state = self.derivative_state
+            kp_applied = (
+                phase_start_weight * self.startup_kp
+                + phase_cruise_weight * self.phase_hold_cruise_kp
+                + phase_late_weight * self.phase_hold_late_kp
+            )
+        else:
+            error = rho_control - rho_star
+            p_term, i_term, d_term, control_log_factor, derivative_state = self._compute_pid_terms(
+                error,
+                measurement_for_control_is_valid,
+                freeze_positive_integral=freeze_positive_integral,
+                kp_override=kp_applied,
+            )
         alignment_penalty_term = 0.0
         if self.alignment_aware and measurement_for_control_is_valid and alignment_c is not None:
             alignment_penalty_term = self.alignment_penalty * max(
@@ -735,7 +891,9 @@ class NanochatMuonController:
             )
         startup_alpha_reference = None
         startup_log_term = 0.0
-        startup_emergency = alignment_bad_step
+        startup_emergency = alignment_bad_step or (
+            self.action_policy == "phase_hold" and phase_hold_startup_emergency
+        )
         if startup_active and self.startup_alpha_reference_ratio > 1.0:
             startup_alpha_reference = _clip(
                 self.alpha_init * self.startup_alpha_reference_ratio,
@@ -856,6 +1014,15 @@ class NanochatMuonController:
             startup_weight=startup_weight,
             kp_applied=kp_applied,
             factor_max_applied=factor_max_applied,
+            action_policy=self.action_policy,
+            phase_start_weight=phase_start_weight,
+            phase_cruise_weight=phase_cruise_weight,
+            phase_late_weight=phase_late_weight,
+            phase_start_action=phase_start_action,
+            phase_cruise_action=phase_cruise_action,
+            phase_late_action=phase_late_action,
+            phase_cruise_deadband_active=phase_cruise_deadband_active,
+            phase_late_exponent=self.phase_hold_late_exponent,
         )
         self.last_stats = stats
         return stats
@@ -872,6 +1039,7 @@ class NanochatMuonController:
             "prev_error": self.prev_error,
             "trust_good_count": self.trust_good_count,
             "alignment_aware": self.alignment_aware,
+            "action_policy": self.action_policy,
             "num_updates": self.num_updates,
             "last_stats": None if self.last_stats is None else self.last_stats.as_dict(),
         }

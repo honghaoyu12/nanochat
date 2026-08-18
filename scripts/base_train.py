@@ -33,7 +33,9 @@ from nanochat.tokenizer import get_tokenizer, get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
 from nanochat.controlled_muon import (
     ABSOLUTE_GROUP_SCALING_MODES,
+    CONTROL_ACTION_POLICIES,
     CONTROL_FEEDBACK_SCOPES,
+    PHASE_HOLD_CRUISE_POLICIES,
     NanochatMuonController,
     LossProgressRhoReference,
     ThreeStageLossProgressRhoReference,
@@ -127,6 +129,12 @@ parser.add_argument("--control-startup-monotone", action="store_true", help="dur
 parser.add_argument("--control-startup-emergency-rho", type=float, default=-0.25, help="trusted rho below which startup safety may reduce alpha")
 parser.add_argument("--control-startup-kp", type=float, default=-1.0, help="startup proportional gain for three-stage rho reference; -1 uses control-kp")
 parser.add_argument("--control-startup-factor-max", type=float, default=-1.0, help="startup factor ceiling for three-stage rho reference; -1 uses control-factor-max")
+parser.add_argument("--control-action-policy", type=str, default="legacy", choices=sorted(CONTROL_ACTION_POLICIES), help="legacy signed controller or opt-in phase-specific action authority")
+parser.add_argument("--control-phase-hold-cruise-policy", type=str, default="hold", choices=sorted(PHASE_HOLD_CRUISE_POLICIES), help="exact alpha hold or low-authority rho deadband during cruise")
+parser.add_argument("--control-phase-hold-cruise-kp", type=float, default=0.0, help="cruise rho-deadband gain for phase_hold")
+parser.add_argument("--control-phase-hold-cruise-deadband", type=float, default=0.05, help="half-width of the phase_hold cruise rho deadband")
+parser.add_argument("--control-phase-hold-late-kp", type=float, default=0.03, help="one-sided downward late gain for phase_hold")
+parser.add_argument("--control-phase-hold-late-exponent", type=float, default=2.0, help="exponent applied to autonomous late-phase authority")
 parser.add_argument("--control-rho-star", type=float, default=0.7, help="target rho")
 parser.add_argument("--control-rho-reference", type=str, default="fixed", choices=["fixed", "loss_progress", "loss_progress_three_stage"], help="fixed, two-stage, or three-stage loss-progress rho target")
 parser.add_argument("--control-rho-start", type=float, default=None, help="startup rho target for loss_progress_three_stage reference")
@@ -243,6 +251,25 @@ if args.control_startup_kp >= 0 and args.control_rho_reference != "loss_progress
     raise ValueError("--control-startup-kp requires loss_progress_three_stage")
 if args.control_startup_factor_max >= 0 and args.control_rho_reference != "loss_progress_three_stage":
     raise ValueError("--control-startup-factor-max requires loss_progress_three_stage")
+if args.control_action_policy == "phase_hold":
+    if args.control_rho_reference != "loss_progress_three_stage":
+        raise ValueError("phase_hold action policy requires loss_progress_three_stage")
+    if args.control_alpha_mode != "absolute" or args.control_scope != "muon_only":
+        raise ValueError("phase_hold requires absolute Muon-only control")
+    if args.optimizer_variant not in {"controlled_muon_raw", "controlled_muon_ema", "controlled_muon_ema_trust"}:
+        raise ValueError("phase_hold is currently supported only for P controlled_muon variants")
+    if args.control_startup_kp < 0:
+        raise ValueError("phase_hold requires an explicit non-negative startup kp")
+    if args.control_phase_hold_cruise_policy == "hold" and args.control_phase_hold_cruise_kp != 0.0:
+        raise ValueError("phase_hold exact cruise requires zero cruise kp")
+    if args.control_phase_hold_cruise_policy == "rho_deadband" and args.control_phase_hold_cruise_kp <= 0.0:
+        raise ValueError("phase_hold rho deadband requires positive cruise kp")
+    if args.control_phase_hold_cruise_deadband < 0.0:
+        raise ValueError("phase_hold cruise deadband must be non-negative")
+    if args.control_phase_hold_late_kp < 0.0:
+        raise ValueError("phase_hold late kp must be non-negative")
+    if args.control_phase_hold_late_exponent < 1.0:
+        raise ValueError("phase_hold late exponent must be at least 1")
 if args.control_alignment_aware and args.optimizer_variant not in CONTROLLED_MUON_VARIANTS:
     raise ValueError("--control-alignment-aware requires a controlled P/PI/PID Muon variant")
 if args.seed < 0:
@@ -681,6 +708,23 @@ if controlled_muon_enabled:
             if args.control_startup_factor_max >= 0
             else None
         ),
+        action_policy=args.control_action_policy,
+        phase_hold_cruise_policy=args.control_phase_hold_cruise_policy,
+        phase_hold_start_rho=(
+            args.control_rho_start
+            if args.control_rho_start is not None
+            else args.control_rho_star
+        ),
+        phase_hold_cruise_rho=control_rho_cruise,
+        phase_hold_cruise_kp=args.control_phase_hold_cruise_kp,
+        phase_hold_cruise_deadband=args.control_phase_hold_cruise_deadband,
+        phase_hold_late_rho=(
+            control_rho_late
+            if control_rho_late is not None
+            else args.control_rho_star
+        ),
+        phase_hold_late_kp=args.control_phase_hold_late_kp,
+        phase_hold_late_exponent=args.control_phase_hold_late_exponent,
     )
     if not control_output_dir:
         control_output_dir = os.path.join(base_dir, "controlled_optimizer_outputs", output_dirname, args.optimizer_variant)
@@ -778,6 +822,10 @@ controller_csv_fields = [
     "startup_active", "startup_alpha_reference", "startup_log_term",
     "startup_emergency", "startup_monotone_clamped", "startup_weight",
     "kp_applied", "factor_max_applied",
+    "action_policy", "phase_start_weight", "phase_cruise_weight",
+    "phase_late_weight", "phase_start_action", "phase_cruise_action",
+    "phase_late_action", "phase_cruise_deadband_active",
+    "phase_late_exponent",
     "rho_phase_observation_count", "rho_phase_loss_fast",
     "rho_phase_loss_slow", "rho_phase_relative_progress", "rho_phase_progress_reference",
     "rho_phase_progress_ratio", "rho_phase_candidate", "rho_phase",
@@ -1307,6 +1355,7 @@ while True:
                 feedback_invalid_reason=feedback_invalid_reason,
                 startup_active=startup_active,
                 startup_weight=startup_weight,
+                late_phase=float(getattr(rho_reference, "late_phase", 0.0)),
                 rho_star_override=None if rho_reference is None else rho_reference.rho_star,
             )
     model.zero_grad(set_to_none=True)
@@ -1361,6 +1410,15 @@ while True:
             "startup_weight": control_stats.startup_weight,
             "kp_applied": control_stats.kp_applied,
             "factor_max_applied": control_stats.factor_max_applied,
+            "action_policy": control_stats.action_policy,
+            "phase_start_weight": control_stats.phase_start_weight,
+            "phase_cruise_weight": control_stats.phase_cruise_weight,
+            "phase_late_weight": control_stats.phase_late_weight,
+            "phase_start_action": control_stats.phase_start_action,
+            "phase_cruise_action": control_stats.phase_cruise_action,
+            "phase_late_action": control_stats.phase_late_action,
+            "phase_cruise_deadband_active": int(control_stats.phase_cruise_deadband_active),
+            "phase_late_exponent": control_stats.phase_late_exponent,
             "rho_reference_mode": args.control_rho_reference,
             "rho_phase_observation_count": "" if rho_reference is None else rho_reference.observation_count,
             "rho_phase_loss_fast": "" if rho_reference is None else rho_reference.loss_fast,
