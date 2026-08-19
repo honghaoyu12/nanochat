@@ -197,6 +197,17 @@ def _phase_hold_controller(**overrides):
     return NanochatMuonController(**kwargs)
 
 
+def _phase_hold_recovery_controller(**overrides):
+    kwargs = {
+        "action_policy": "phase_hold_recovery",
+        "phase_hold_late_kp": 0.0,
+        "recovery_terminal_ratio": 0.4,
+        "recovery_exponent": 2.0,
+    }
+    kwargs.update(overrides)
+    return _phase_hold_controller(**kwargs)
+
+
 def test_legacy_policy_ignores_phase_hold_only_parameters():
     controller = NanochatMuonController(
         variant="controlled_muon_ema",
@@ -400,6 +411,260 @@ def test_phase_hold_deadband_invalid_feedback_and_state_roundtrip():
     assert restored.last_stats.phase_late_weight == pytest.approx(
         controller.last_stats.phase_late_weight
     )
+
+
+def test_phase_hold_recovery_ratio_one_matches_phase_hold_sequence():
+    phase_hold = _phase_hold_controller(phase_hold_late_kp=0.0)
+    recovery = _phase_hold_recovery_controller(recovery_terminal_ratio=1.0)
+    observations = [
+        (1.0, 0.0, 0.5),
+        (0.4, 0.0, 0.5),
+        (0.0, 0.0, 0.5),
+        (0.0, 0.2, 0.4),
+        (0.0, 0.7, 0.3),
+        (0.0, 1.0, 0.2),
+    ]
+
+    for step, (startup_weight, late_phase, actual) in enumerate(observations):
+        kwargs = {
+            "step": step,
+            "loss_before": 1.0,
+            "loss_after": 1.0 - actual,
+            "predicted_decrease": 0.5,
+            "startup_weight": startup_weight,
+            "late_phase": late_phase,
+        }
+        phase_stats = phase_hold.update(**kwargs)
+        recovery_stats = recovery.update(**kwargs)
+        assert recovery_stats.alpha_next == pytest.approx(phase_stats.alpha_next)
+        assert recovery_stats.control_log_factor == pytest.approx(
+            phase_stats.control_log_factor
+        )
+        assert recovery_stats.recovery_cap_binding is False
+
+
+def test_phase_hold_recovery_discovers_peak_only_before_late_phase():
+    controller = _phase_hold_recovery_controller(
+        alpha_max=4.0,
+        startup_kp=0.5,
+        startup_factor_max=2.0,
+    )
+    first = controller.update(
+        step=0,
+        loss_before=1.0,
+        loss_after=0.5,
+        predicted_decrease=0.5,
+        startup_weight=1.0,
+        late_phase=0.0,
+    )
+    assert first.alpha_next > first.alpha
+    assert first.recovery_alpha_peak == pytest.approx(first.alpha_next)
+    assert first.recovery_peak_frozen is False
+    assert first.recovery_alpha_cap == pytest.approx(first.alpha_next)
+
+    cruise = controller.update(
+        step=1,
+        loss_before=1.0,
+        loss_after=0.5,
+        predicted_decrease=0.5,
+        startup_weight=0.0,
+        late_phase=0.0,
+    )
+    assert cruise.alpha_next == pytest.approx(first.alpha_next)
+    assert cruise.recovery_alpha_peak == pytest.approx(first.alpha_next)
+
+    late = controller.update(
+        step=2,
+        loss_before=1.0,
+        loss_after=0.5,
+        predicted_decrease=0.5,
+        startup_weight=0.0,
+        late_phase=0.1,
+    )
+    assert late.recovery_peak_frozen is True
+    assert late.recovery_alpha_peak == pytest.approx(first.alpha_next)
+    frozen_peak = late.recovery_alpha_peak
+
+    controller.update(
+        step=3,
+        loss_before=1.0,
+        loss_after=0.5,
+        predicted_decrease=0.5,
+        startup_weight=1.0,
+        late_phase=0.0,
+    )
+    assert controller.recovery_alpha_peak == pytest.approx(frozen_peak)
+
+
+def test_phase_hold_recovery_cap_is_monotone_after_peak_freeze():
+    controller = _phase_hold_recovery_controller()
+    controller.update(
+        step=0,
+        loss_before=1.0,
+        loss_after=0.5,
+        predicted_decrease=0.5,
+        startup_weight=1.0,
+        late_phase=0.0,
+    )
+    caps = []
+    phases = [0.1, 0.4, 0.2, 0.8, 1.0]
+    for step, phase in enumerate(phases, start=1):
+        stats = controller.update(
+            step=step,
+            loss_before=1.0,
+            loss_after=0.5,
+            predicted_decrease=0.5,
+            startup_weight=0.0,
+            late_phase=phase,
+        )
+        caps.append(stats.recovery_alpha_cap)
+    assert all(right <= left for left, right in zip(caps, caps[1:]))
+    assert controller.recovery_max_late_phase == pytest.approx(1.0)
+    assert caps[-1] == pytest.approx(
+        controller.recovery_alpha_peak * controller.recovery_terminal_ratio
+    )
+
+
+def test_phase_hold_recovery_ratio_and_exponent_order_caps():
+    common = {
+        "action_policy": "phase_hold_recovery",
+        "phase_hold_late_kp": 0.0,
+    }
+    ratio_small = _phase_hold_controller(
+        **common, recovery_terminal_ratio=0.4, recovery_exponent=4.0
+    )
+    ratio_large = _phase_hold_controller(
+        **common, recovery_terminal_ratio=0.6, recovery_exponent=4.0
+    )
+    exponent_two = _phase_hold_controller(
+        **common, recovery_terminal_ratio=0.4, recovery_exponent=2.0
+    )
+    exponent_four = _phase_hold_controller(
+        **common, recovery_terminal_ratio=0.4, recovery_exponent=4.0
+    )
+    controllers = [ratio_small, ratio_large, exponent_two, exponent_four]
+    for controller in controllers:
+        controller.update(
+            step=0,
+            loss_before=1.0,
+            loss_after=0.5,
+            predicted_decrease=0.5,
+            startup_weight=1.0,
+            late_phase=0.0,
+        )
+    stats = [
+        controller.update(
+            step=1,
+            loss_before=1.0,
+            loss_after=0.5,
+            predicted_decrease=0.5,
+            startup_weight=0.0,
+            late_phase=0.5,
+        )
+        for controller in controllers
+    ]
+    assert stats[0].recovery_alpha_cap <= stats[1].recovery_alpha_cap
+    assert stats[2].recovery_alpha_cap <= stats[3].recovery_alpha_cap
+
+
+def test_phase_hold_recovery_respects_global_alpha_bounds():
+    controller = _phase_hold_recovery_controller(
+        alpha_min=0.75,
+        alpha_max=1.5,
+        recovery_terminal_ratio=0.01,
+    )
+    controller.update(
+        step=0,
+        loss_before=1.0,
+        loss_after=0.5,
+        predicted_decrease=0.5,
+        startup_weight=1.0,
+        late_phase=0.0,
+    )
+    terminal = controller.update(
+        step=1,
+        loss_before=1.0,
+        loss_after=0.5,
+        predicted_decrease=0.5,
+        startup_weight=0.0,
+        late_phase=1.0,
+    )
+    assert terminal.alpha_next == pytest.approx(controller.alpha_min)
+    assert terminal.recovery_alpha_cap == pytest.approx(controller.alpha_min)
+
+
+def test_phase_hold_recovery_invalid_feedback_cannot_relax_cap():
+    controller = _phase_hold_recovery_controller()
+    controller.update(
+        step=0,
+        loss_before=1.0,
+        loss_after=0.5,
+        predicted_decrease=0.5,
+        startup_weight=1.0,
+        late_phase=0.0,
+    )
+    established = controller.update(
+        step=1,
+        loss_before=1.0,
+        loss_after=0.5,
+        predicted_decrease=0.5,
+        startup_weight=0.0,
+        late_phase=0.6,
+    )
+    invalid = controller.update(
+        step=2,
+        loss_before=1.0,
+        loss_after=0.5,
+        predicted_decrease=0.5,
+        feedback_observation_valid=False,
+        feedback_invalid_reason="test_invalid",
+        startup_weight=0.0,
+        late_phase=0.2,
+    )
+    assert invalid.recovery_late_phase_monotone == pytest.approx(0.6)
+    assert invalid.recovery_alpha_cap == pytest.approx(established.recovery_alpha_cap)
+    assert invalid.alpha_next <= established.recovery_alpha_cap
+
+
+def test_phase_hold_recovery_state_roundtrip_reproduces_next_alpha():
+    controller = _phase_hold_recovery_controller()
+    for step, phase in enumerate((0.0, 0.3, 0.7)):
+        controller.update(
+            step=step,
+            loss_before=1.0,
+            loss_after=0.5,
+            predicted_decrease=0.5,
+            startup_weight=1.0 if step == 0 else 0.0,
+            late_phase=phase,
+        )
+    restored = _phase_hold_recovery_controller()
+    restored.load_state_dict(controller.state_dict())
+    kwargs = {
+        "step": 3,
+        "loss_before": 1.0,
+        "loss_after": 0.5,
+        "predicted_decrease": 0.5,
+        "startup_weight": 0.0,
+        "late_phase": 0.9,
+    }
+    expected = controller.update(**kwargs)
+    actual = restored.update(**kwargs)
+    assert actual.alpha_next == pytest.approx(expected.alpha_next)
+    assert actual.recovery_alpha_cap == pytest.approx(expected.recovery_alpha_cap)
+    assert actual.recovery_cap_binding_count == expected.recovery_cap_binding_count
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"recovery_terminal_ratio": 0.0}, "terminal ratio"),
+        ({"recovery_terminal_ratio": 1.01}, "terminal ratio"),
+        ({"recovery_exponent": 0.5}, "exponent"),
+    ],
+)
+def test_phase_hold_recovery_rejects_invalid_configuration(overrides, message):
+    with pytest.raises(ValueError, match=message):
+        _phase_hold_recovery_controller(**overrides)
 
 
 def test_three_stage_reference_moves_startup_then_late_and_roundtrips():

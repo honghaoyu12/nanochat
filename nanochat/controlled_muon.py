@@ -17,7 +17,7 @@ def _clip(value: float, lower: float, upper: float) -> float:
 
 ABSOLUTE_GROUP_SCALING_MODES = {"uniform", "initial_lr_ratio"}
 CONTROL_FEEDBACK_SCOPES = {"total", "muon_residual_proxy"}
-CONTROL_ACTION_POLICIES = {"legacy", "phase_hold"}
+CONTROL_ACTION_POLICIES = {"legacy", "phase_hold", "phase_hold_recovery"}
 PHASE_HOLD_CRUISE_POLICIES = {"hold", "rho_deadband"}
 CONTROL_FEEDBACK_STATE_SCHEMA_VERSION = 1
 
@@ -231,6 +231,18 @@ class NanochatMuonControlStats:
     phase_late_action: float = 0.0
     phase_cruise_deadband_active: bool = False
     phase_late_exponent: float = 1.0
+    recovery_enabled: bool = False
+    recovery_terminal_ratio: float = 1.0
+    recovery_exponent: float = 4.0
+    recovery_alpha_peak: float | None = None
+    recovery_peak_frozen: bool = False
+    recovery_late_phase_raw: float = 0.0
+    recovery_late_phase_monotone: float = 0.0
+    recovery_progress: float = 0.0
+    recovery_alpha_uncapped: float | None = None
+    recovery_alpha_cap: float | None = None
+    recovery_cap_binding: bool = False
+    recovery_cap_binding_count: int = 0
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -309,6 +321,8 @@ class NanochatMuonController:
         phase_hold_late_rho: float = 0.90,
         phase_hold_late_kp: float = 0.03,
         phase_hold_late_exponent: float = 2.0,
+        recovery_terminal_ratio: float = 1.0,
+        recovery_exponent: float = 4.0,
     ) -> None:
         if variant not in self.VALID_VARIANTS:
             raise ValueError(f"unknown controlled Muon variant: {variant}")
@@ -354,7 +368,8 @@ class NanochatMuonController:
             raise ValueError("startup factor max must be finite and at least factor_min")
         if action_policy not in CONTROL_ACTION_POLICIES:
             raise ValueError(f"unknown control action policy: {action_policy}")
-        if action_policy == "phase_hold":
+        phase_hold_enabled = action_policy in {"phase_hold", "phase_hold_recovery"}
+        if phase_hold_enabled:
             if phase_hold_cruise_policy not in PHASE_HOLD_CRUISE_POLICIES:
                 raise ValueError(f"unknown phase-hold cruise policy: {phase_hold_cruise_policy}")
             phase_values = (
@@ -380,6 +395,11 @@ class NanochatMuonController:
                 raise ValueError("phase-hold exact cruise requires zero cruise gain")
             if phase_hold_cruise_policy == "rho_deadband" and phase_hold_cruise_kp <= 0.0:
                 raise ValueError("phase-hold rho deadband requires positive cruise gain")
+        if action_policy == "phase_hold_recovery":
+            if not math.isfinite(recovery_terminal_ratio) or not 0.0 < recovery_terminal_ratio <= 1.0:
+                raise ValueError("recovery terminal ratio must be finite and in (0, 1]")
+            if not math.isfinite(recovery_exponent) or recovery_exponent < 1.0:
+                raise ValueError("recovery exponent must be finite and at least 1")
 
         self.variant = variant
         self.controller_family = self._parse_family(variant)
@@ -435,6 +455,8 @@ class NanochatMuonController:
         self.phase_hold_late_rho = float(phase_hold_late_rho)
         self.phase_hold_late_kp = float(phase_hold_late_kp)
         self.phase_hold_late_exponent = float(phase_hold_late_exponent)
+        self.recovery_terminal_ratio = float(recovery_terminal_ratio)
+        self.recovery_exponent = float(recovery_exponent)
 
         self.use_rho_ema = variant.endswith("_ema") or variant.endswith("_ema_trust")
         self.use_trust_region = variant.endswith("_ema_trust")
@@ -445,6 +467,11 @@ class NanochatMuonController:
         self.trust_good_count = 0
         self.num_updates = 0
         self.last_stats: NanochatMuonControlStats | None = None
+        self.recovery_alpha_peak = self.alpha
+        self.recovery_peak_frozen = False
+        self.recovery_max_late_phase = 0.0
+        self.recovery_cap = self.alpha
+        self.recovery_cap_binding_count = 0
 
     @staticmethod
     def _parse_family(variant: str) -> str:
@@ -505,6 +532,13 @@ class NanochatMuonController:
             "phase_hold_late_rho": self.phase_hold_late_rho,
             "phase_hold_late_kp": self.phase_hold_late_kp,
             "phase_hold_late_exponent": self.phase_hold_late_exponent,
+            "recovery_terminal_ratio": self.recovery_terminal_ratio,
+            "recovery_exponent": self.recovery_exponent,
+            "recovery_alpha_peak": self.recovery_alpha_peak,
+            "recovery_peak_frozen": self.recovery_peak_frozen,
+            "recovery_max_late_phase": self.recovery_max_late_phase,
+            "recovery_cap": self.recovery_cap,
+            "recovery_cap_binding_count": self.recovery_cap_binding_count,
             "rho_ema": self.rho_ema,
             "integral_state": self.integral_state,
             "derivative_state": self.derivative_state,
@@ -524,7 +558,8 @@ class NanochatMuonController:
                 f"cannot load {saved_action_policy} action policy with {self.action_policy} configured"
             )
         saved_cruise_policy = state.get("phase_hold_cruise_policy", "hold")
-        if self.action_policy == "phase_hold" and saved_cruise_policy != self.phase_hold_cruise_policy:
+        phase_hold_enabled = self.action_policy in {"phase_hold", "phase_hold_recovery"}
+        if phase_hold_enabled and saved_cruise_policy != self.phase_hold_cruise_policy:
             raise ValueError("cannot load controller state with different phase-hold cruise policy")
         for name in (
             "phase_hold_start_rho",
@@ -535,10 +570,16 @@ class NanochatMuonController:
             "phase_hold_late_kp",
             "phase_hold_late_exponent",
         ):
-            if self.action_policy == "phase_hold" and not math.isclose(
+            if phase_hold_enabled and not math.isclose(
                 float(state[name]), getattr(self, name), rel_tol=1e-12, abs_tol=1e-12
             ):
                 raise ValueError(f"phase-hold controller configuration mismatch: {name}")
+        if self.action_policy == "phase_hold_recovery":
+            for name in ("recovery_terminal_ratio", "recovery_exponent"):
+                if not math.isclose(
+                    float(state[name]), getattr(self, name), rel_tol=1e-12, abs_tol=1e-12
+                ):
+                    raise ValueError(f"recovery controller configuration mismatch: {name}")
 
         for name in (
             "alpha_min",
@@ -597,6 +638,18 @@ class NanochatMuonController:
         self.prev_error = None if state.get("prev_error") is None else float(state["prev_error"])
         self.trust_good_count = int(state.get("trust_good_count", 0))
         self.num_updates = int(state.get("num_updates", 0))
+        if self.action_policy == "phase_hold_recovery":
+            self.recovery_alpha_peak = _clip(
+                float(state["recovery_alpha_peak"]), self.alpha_min, self.alpha_max
+            )
+            self.recovery_peak_frozen = bool(state["recovery_peak_frozen"])
+            self.recovery_max_late_phase = _clip(
+                float(state["recovery_max_late_phase"]), 0.0, 1.0
+            )
+            self.recovery_cap = _clip(
+                float(state["recovery_cap"]), self.alpha_min, self.alpha_max
+            )
+            self.recovery_cap_binding_count = int(state["recovery_cap_binding_count"])
         self.use_rho_ema = self.variant.endswith("_ema") or self.variant.endswith("_ema_trust")
         self.use_trust_region = self.variant.endswith("_ema_trust")
         last_stats = state.get("last_stats")
@@ -824,7 +877,8 @@ class NanochatMuonController:
             measurement_for_control_is_valid
             and rho_control <= self.startup_emergency_rho
         )
-        if self.action_policy == "phase_hold":
+        phase_hold_enabled = self.action_policy in {"phase_hold", "phase_hold_recovery"}
+        if phase_hold_enabled:
             rho_star = (
                 phase_start_weight * self.phase_hold_start_rho
                 + phase_cruise_weight * self.phase_hold_cruise_rho
@@ -892,7 +946,7 @@ class NanochatMuonController:
         startup_alpha_reference = None
         startup_log_term = 0.0
         startup_emergency = alignment_bad_step or (
-            self.action_policy == "phase_hold" and phase_hold_startup_emergency
+            phase_hold_enabled and phase_hold_startup_emergency
         )
         if startup_active and self.startup_alpha_reference_ratio > 1.0:
             startup_alpha_reference = _clip(
@@ -960,6 +1014,35 @@ class NanochatMuonController:
         ):
             alpha_next = alpha_used
             startup_monotone_clamped = True
+        recovery_enabled = self.action_policy == "phase_hold_recovery"
+        recovery_alpha_uncapped = alpha_next
+        recovery_late_phase_raw = late_phase
+        recovery_progress = 0.0
+        recovery_cap_binding = False
+        if recovery_enabled:
+            if not self.recovery_peak_frozen and late_phase == 0.0:
+                self.recovery_alpha_peak = max(self.recovery_alpha_peak, alpha_next)
+                self.recovery_cap = self.recovery_alpha_peak
+            else:
+                if not self.recovery_peak_frozen:
+                    self.recovery_peak_frozen = True
+                self.recovery_max_late_phase = max(
+                    self.recovery_max_late_phase, late_phase
+                )
+                recovery_progress = (
+                    self.recovery_max_late_phase ** self.recovery_exponent
+                )
+                proposed_cap = self.recovery_alpha_peak * (
+                    self.recovery_terminal_ratio ** recovery_progress
+                )
+                self.recovery_cap = min(
+                    self.recovery_cap,
+                    _clip(proposed_cap, self.alpha_min, self.alpha_max),
+                )
+                alpha_next = min(alpha_next, self.recovery_cap)
+                recovery_cap_binding = alpha_next < recovery_alpha_uncapped
+                if recovery_cap_binding:
+                    self.recovery_cap_binding_count += 1
         self.alpha = alpha_next
         self.log_alpha = math.log(alpha_next)
         self.num_updates += 1
@@ -1023,6 +1106,22 @@ class NanochatMuonController:
             phase_late_action=phase_late_action,
             phase_cruise_deadband_active=phase_cruise_deadband_active,
             phase_late_exponent=self.phase_hold_late_exponent,
+            recovery_enabled=recovery_enabled,
+            recovery_terminal_ratio=self.recovery_terminal_ratio,
+            recovery_exponent=self.recovery_exponent,
+            recovery_alpha_peak=self.recovery_alpha_peak if recovery_enabled else None,
+            recovery_peak_frozen=self.recovery_peak_frozen if recovery_enabled else False,
+            recovery_late_phase_raw=recovery_late_phase_raw,
+            recovery_late_phase_monotone=(
+                self.recovery_max_late_phase if recovery_enabled else 0.0
+            ),
+            recovery_progress=recovery_progress,
+            recovery_alpha_uncapped=recovery_alpha_uncapped,
+            recovery_alpha_cap=self.recovery_cap if recovery_enabled else None,
+            recovery_cap_binding=recovery_cap_binding,
+            recovery_cap_binding_count=(
+                self.recovery_cap_binding_count if recovery_enabled else 0
+            ),
         )
         self.last_stats = stats
         return stats

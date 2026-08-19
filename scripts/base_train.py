@@ -135,6 +135,8 @@ parser.add_argument("--control-phase-hold-cruise-kp", type=float, default=0.0, h
 parser.add_argument("--control-phase-hold-cruise-deadband", type=float, default=0.05, help="half-width of the phase_hold cruise rho deadband")
 parser.add_argument("--control-phase-hold-late-kp", type=float, default=0.03, help="one-sided downward late gain for phase_hold")
 parser.add_argument("--control-phase-hold-late-exponent", type=float, default=2.0, help="exponent applied to autonomous late-phase authority")
+parser.add_argument("--control-recovery-terminal-ratio", type=float, default=1.0, help="terminal alpha cap as a fraction of the frozen pre-late peak")
+parser.add_argument("--control-recovery-exponent", type=float, default=4.0, help="exponent shaping monotone late-phase recovery progress")
 parser.add_argument("--control-rho-star", type=float, default=0.7, help="target rho")
 parser.add_argument("--control-rho-reference", type=str, default="fixed", choices=["fixed", "loss_progress", "loss_progress_three_stage"], help="fixed, two-stage, or three-stage loss-progress rho target")
 parser.add_argument("--control-rho-start", type=float, default=None, help="startup rho target for loss_progress_three_stage reference")
@@ -251,15 +253,16 @@ if args.control_startup_kp >= 0 and args.control_rho_reference != "loss_progress
     raise ValueError("--control-startup-kp requires loss_progress_three_stage")
 if args.control_startup_factor_max >= 0 and args.control_rho_reference != "loss_progress_three_stage":
     raise ValueError("--control-startup-factor-max requires loss_progress_three_stage")
-if args.control_action_policy == "phase_hold":
+phase_hold_enabled = args.control_action_policy in {"phase_hold", "phase_hold_recovery"}
+if phase_hold_enabled:
     if args.control_rho_reference != "loss_progress_three_stage":
-        raise ValueError("phase_hold action policy requires loss_progress_three_stage")
+        raise ValueError("phase-hold action policies require loss_progress_three_stage")
     if args.control_alpha_mode not in {"absolute", "multiplier"} or args.control_scope != "muon_only":
-        raise ValueError("phase_hold requires absolute or multiplier Muon-only control")
+        raise ValueError("phase-hold action policies require absolute or multiplier Muon-only control")
     if args.optimizer_variant not in {"controlled_muon_raw", "controlled_muon_ema", "controlled_muon_ema_trust"}:
-        raise ValueError("phase_hold is currently supported only for P controlled_muon variants")
+        raise ValueError("phase-hold action policies are supported only for P controlled_muon variants")
     if args.control_startup_kp < 0:
-        raise ValueError("phase_hold requires an explicit non-negative startup kp")
+        raise ValueError("phase-hold action policies require an explicit non-negative startup kp")
     if args.control_phase_hold_cruise_policy == "hold" and args.control_phase_hold_cruise_kp != 0.0:
         raise ValueError("phase_hold exact cruise requires zero cruise kp")
     if args.control_phase_hold_cruise_policy == "rho_deadband" and args.control_phase_hold_cruise_kp <= 0.0:
@@ -270,6 +273,16 @@ if args.control_action_policy == "phase_hold":
         raise ValueError("phase_hold late kp must be non-negative")
     if args.control_phase_hold_late_exponent < 1.0:
         raise ValueError("phase_hold late exponent must be at least 1")
+if args.control_action_policy == "phase_hold_recovery":
+    if not math.isfinite(args.control_recovery_terminal_ratio) or not 0 < args.control_recovery_terminal_ratio <= 1:
+        raise ValueError("phase_hold_recovery terminal ratio must be finite and in (0, 1]")
+    if not math.isfinite(args.control_recovery_exponent) or args.control_recovery_exponent < 1:
+        raise ValueError("phase_hold_recovery exponent must be finite and at least 1")
+elif (
+    args.control_recovery_terminal_ratio != 1.0
+    or args.control_recovery_exponent != 4.0
+):
+    raise ValueError("recovery flags require --control-action-policy=phase_hold_recovery")
 if args.control_alignment_aware and args.optimizer_variant not in CONTROLLED_MUON_VARIANTS:
     raise ValueError("--control-alignment-aware requires a controlled P/PI/PID Muon variant")
 if args.seed < 0:
@@ -725,6 +738,8 @@ if controlled_muon_enabled:
         ),
         phase_hold_late_kp=args.control_phase_hold_late_kp,
         phase_hold_late_exponent=args.control_phase_hold_late_exponent,
+        recovery_terminal_ratio=args.control_recovery_terminal_ratio,
+        recovery_exponent=args.control_recovery_exponent,
     )
     if not control_output_dir:
         control_output_dir = os.path.join(base_dir, "controlled_optimizer_outputs", output_dirname, args.optimizer_variant)
@@ -826,6 +841,11 @@ controller_csv_fields = [
     "phase_late_weight", "phase_start_action", "phase_cruise_action",
     "phase_late_action", "phase_cruise_deadband_active",
     "phase_late_exponent",
+    "recovery_enabled", "recovery_terminal_ratio", "recovery_exponent",
+    "recovery_alpha_peak", "recovery_peak_frozen",
+    "recovery_late_phase_raw", "recovery_late_phase_monotone",
+    "recovery_progress", "recovery_alpha_uncapped", "recovery_alpha_cap",
+    "recovery_cap_binding", "recovery_cap_binding_count",
     "rho_phase_observation_count", "rho_phase_loss_fast",
     "rho_phase_loss_slow", "rho_phase_relative_progress", "rho_phase_progress_reference",
     "rho_phase_progress_ratio", "rho_phase_candidate", "rho_phase",
@@ -1419,6 +1439,18 @@ while True:
             "phase_late_action": control_stats.phase_late_action,
             "phase_cruise_deadband_active": int(control_stats.phase_cruise_deadband_active),
             "phase_late_exponent": control_stats.phase_late_exponent,
+            "recovery_enabled": int(control_stats.recovery_enabled),
+            "recovery_terminal_ratio": control_stats.recovery_terminal_ratio,
+            "recovery_exponent": control_stats.recovery_exponent,
+            "recovery_alpha_peak": control_stats.recovery_alpha_peak,
+            "recovery_peak_frozen": int(control_stats.recovery_peak_frozen),
+            "recovery_late_phase_raw": control_stats.recovery_late_phase_raw,
+            "recovery_late_phase_monotone": control_stats.recovery_late_phase_monotone,
+            "recovery_progress": control_stats.recovery_progress,
+            "recovery_alpha_uncapped": control_stats.recovery_alpha_uncapped,
+            "recovery_alpha_cap": control_stats.recovery_alpha_cap,
+            "recovery_cap_binding": int(control_stats.recovery_cap_binding),
+            "recovery_cap_binding_count": control_stats.recovery_cap_binding_count,
             "rho_reference_mode": args.control_rho_reference,
             "rho_phase_observation_count": "" if rho_reference is None else rho_reference.observation_count,
             "rho_phase_loss_fast": "" if rho_reference is None else rho_reference.loss_fast,
