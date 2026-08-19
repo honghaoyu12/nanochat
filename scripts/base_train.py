@@ -254,8 +254,8 @@ if args.control_startup_factor_max >= 0 and args.control_rho_reference != "loss_
 if args.control_action_policy == "phase_hold":
     if args.control_rho_reference != "loss_progress_three_stage":
         raise ValueError("phase_hold action policy requires loss_progress_three_stage")
-    if args.control_alpha_mode != "absolute" or args.control_scope != "muon_only":
-        raise ValueError("phase_hold requires absolute Muon-only control")
+    if args.control_alpha_mode not in {"absolute", "multiplier"} or args.control_scope != "muon_only":
+        raise ValueError("phase_hold requires absolute or multiplier Muon-only control")
     if args.optimizer_variant not in {"controlled_muon_raw", "controlled_muon_ema", "controlled_muon_ema_trust"}:
         raise ValueError("phase_hold is currently supported only for P controlled_muon variants")
     if args.control_startup_kp < 0:

@@ -278,6 +278,54 @@ def test_phase_hold_startup_cruise_and_late_actions_are_one_sided():
     assert no_late_increase.alpha_next == pytest.approx(no_late_increase.alpha)
 
 
+def test_phase_hold_supports_multiplier_scale_rise_hold_and_late_decline():
+    controller = _phase_hold_controller(
+        alpha_init=1.0,
+        alpha_min=0.5,
+        alpha_max=1.35,
+        startup_kp=0.12,
+        startup_factor_max=1.02,
+        factor_min=0.98,
+        factor_max=1.02,
+        phase_hold_start_rho=0.91,
+        phase_hold_cruise_rho=0.93,
+        phase_hold_late_rho=1.0,
+        phase_hold_late_kp=0.04,
+        phase_hold_late_exponent=4.0,
+    )
+    startup = controller.update(
+        step=0,
+        loss_before=1.0,
+        loss_after=0.5,
+        predicted_decrease=0.5,
+        startup_weight=1.0,
+        late_phase=0.0,
+    )
+    assert startup.alpha == pytest.approx(1.0)
+    assert 1.0 < startup.alpha_next <= 1.02
+
+    cruise = controller.update(
+        step=1,
+        loss_before=1.0,
+        loss_after=0.5,
+        predicted_decrease=0.5,
+        startup_weight=0.0,
+        late_phase=0.0,
+    )
+    assert cruise.alpha_next == pytest.approx(startup.alpha_next)
+
+    late = controller.update(
+        step=2,
+        loss_before=1.0,
+        loss_after=0.55,
+        predicted_decrease=0.5,
+        startup_weight=0.0,
+        late_phase=1.0,
+    )
+    assert late.phase_late_action < 0.0
+    assert 0.5 <= late.alpha_next < cruise.alpha_next
+
+
 def test_phase_hold_late_exponent_delays_authority_and_weights_sum_to_one():
     q2 = _phase_hold_controller(phase_hold_late_exponent=2.0)
     q4 = _phase_hold_controller(phase_hold_late_exponent=4.0)
