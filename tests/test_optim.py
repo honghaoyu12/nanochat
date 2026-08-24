@@ -16,7 +16,7 @@ cuda_available = torch.cuda.is_available()
 pytestmark = pytest.mark.skipif(not cuda_available, reason="optimizer tests require CUDA")
 
 if cuda_available:
-    from nanochat.optim import MuonAdamW
+    from nanochat.optim import KELLER_NS_COEFFICIENTS, MuonAdamW
 
 DEVICE = "cuda"
 
@@ -112,3 +112,71 @@ def test_muon_update_is_orthogonalized():
     # NorMuon variance reduction rescales the magnitude, so normalize by the mean
     svals = svals / svals.mean()
     assert svals.max() / svals.min() < 4.0, f"update far from semi-orthogonal: {svals}"
+@torch.no_grad()
+def keller_reference_step(p, grad, momentum_buffer, lr, momentum, weight_decay, ns_steps):
+    momentum_buffer.lerp_(grad, 1 - momentum)
+    g = grad.lerp(momentum_buffer, momentum)
+    X = g.bfloat16()
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
+    transposed = X.size(-2) > X.size(-1)
+    if transposed:
+        X = X.mT
+    a, b, c = KELLER_NS_COEFFICIENTS
+    for _ in range(ns_steps):
+        A = X @ X.mT
+        B = b * A + c * (A @ A)
+        X = a * X + B @ X
+    if transposed:
+        X = X.mT
+    p.mul_(1 - lr * weight_decay)
+    shape_scale = max(1.0, p.size(-2) / p.size(-1)) ** 0.5
+    p.sub_(lr * shape_scale * X.to(p.dtype))
+
+
+@pytest.mark.parametrize("shape", [MUON_WIDE_SHAPE, MUON_TALL_SHAPE])
+def test_keller_backend_matches_pinned_reference(shape):
+    """The opt-in backend must match the pinned Keller update on both orientations."""
+    gen = torch.Generator(device=DEVICE).manual_seed(20260820 + sum(shape))
+    p = torch.nn.Parameter(torch.randn(shape, generator=gen, device=DEVICE) * 0.05)
+    p_ref = torch.nn.Parameter(p.detach().clone())
+    group = dict(kind="muon", params=[p], lr=0.02, momentum=0.9, ns_steps=5, beta2=0.9, weight_decay=0.07)
+    opt = MuonAdamW([group], muon_backend="keller_original")
+    momentum_ref = torch.zeros_like(p)
+    for step in range(4):
+        lr = 0.02 / (step + 1)
+        momentum = 0.90 + 0.01 * step
+        weight_decay = 0.07 + 0.01 * step
+        group["lr"] = lr
+        group["momentum"] = momentum
+        group["weight_decay"] = weight_decay
+        grad = torch.randn(shape, generator=torch.Generator(device=DEVICE).manual_seed(step), device=DEVICE)
+        p.grad = grad.clone()
+        opt.step()
+        keller_reference_step(p_ref, grad, momentum_ref, lr, momentum, weight_decay, 5)
+    torch.testing.assert_close(p, p_ref, rtol=2e-3, atol=2e-3)
+    torch.testing.assert_close(opt.state[p]["momentum_buffer"][0], momentum_ref, rtol=2e-6, atol=2e-6)
+    assert "second_momentum_buffer" not in opt.state[p]
+
+
+def test_unknown_muon_backend_rejected():
+    p = torch.nn.Parameter(torch.zeros(MUON_WIDE_SHAPE, device=DEVICE))
+    group = dict(kind="muon", params=[p], lr=0.02, momentum=0.95, ns_steps=5, beta2=0.9, weight_decay=0.0)
+    with pytest.raises(ValueError, match="unknown Muon backend"):
+        MuonAdamW([group], muon_backend="not-a-backend")
+
+
+def test_adamw_path_is_identical_across_muon_backends():
+    """Keller selection must not alter the shared AdamW implementation."""
+    p_enhanced = torch.nn.Parameter(torch.randn(48, device=DEVICE, generator=torch.Generator(device=DEVICE).manual_seed(7)))
+    p_keller = torch.nn.Parameter(p_enhanced.detach().clone())
+    group_enhanced = dict(kind="adamw", params=[p_enhanced], lr=0.01, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.1)
+    group_keller = dict(kind="adamw", params=[p_keller], lr=0.01, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.1)
+    opt_enhanced = MuonAdamW([group_enhanced], muon_backend="nanochat_enhanced")
+    opt_keller = MuonAdamW([group_keller], muon_backend="keller_original")
+    for step in range(4):
+        grad = torch.randn(48, generator=torch.Generator(device=DEVICE).manual_seed(900 + step), device=DEVICE)
+        p_enhanced.grad = grad.clone()
+        p_keller.grad = grad.clone()
+        opt_enhanced.step()
+        opt_keller.step()
+    torch.testing.assert_close(p_enhanced, p_keller, rtol=1e-5, atol=1e-6)

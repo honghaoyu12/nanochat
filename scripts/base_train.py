@@ -46,6 +46,7 @@ from nanochat.controlled_muon import (
     validate_control_feedback_configuration,
     validate_resumed_control_feedback,
 )
+from nanochat.dual_controller import NanochatDualActuatorController
 from nanochat.control_governors import (
     AUTONOMOUS_COOLDOWN_VARIANTS,
     AlphaCeilingGovernor,
@@ -63,7 +64,8 @@ AUTONOMOUS_COOLDOWN_MUON_VARIANTS = set(AUTONOMOUS_COOLDOWN_VARIANTS)
 CONTROLLED_MUON_VARIANTS = sorted(
     BASE_CONTROLLED_MUON_VARIANTS | AUTONOMOUS_COOLDOWN_MUON_VARIANTS
 )
-OPTIMIZER_VARIANTS = ["native_muon", "torch_muon"] + CONTROLLED_MUON_VARIANTS
+OPTIMIZER_VARIANTS = ["native_muon", "keller_muon", "torch_muon"] + CONTROLLED_MUON_VARIANTS
+MUON_BACKENDS = ["nanochat_enhanced", "keller_original"]
 
 # -----------------------------------------------------------------------------
 # CLI arguments
@@ -102,6 +104,7 @@ parser.add_argument("--final-lr-frac", type=float, default=0.05, help="final LR 
 parser.add_argument("--resume-from-step", type=int, default=-1, help="resume training from this step (-1 = disable)")
 # Controlled Muon research baseline
 parser.add_argument("--optimizer-variant", type=str, default="native_muon", choices=OPTIMIZER_VARIANTS, help="optimizer/controller variant")
+parser.add_argument("--muon-backend", type=str, default=None, choices=MUON_BACKENDS, help="Muon update backend; controlled variants default to Nanochat enhanced and may opt into Keller original")
 parser.add_argument("--controlled-muon", action="store_true", help="enable controlled Muon every-step probe path")
 parser.add_argument("--control-alpha-mode", type=str, default="absolute", choices=["absolute", "multiplier"], help="absolute alpha replaces controlled group lr; multiplier scales native scheduled controlled group lr")
 parser.add_argument("--control-alpha-reference", type=str, default="none", choices=["none", "native_wsd"], help="alpha reference mode; none means alpha is an absolute actuator")
@@ -109,7 +112,7 @@ parser.add_argument("--control-reference-factor-init", type=float, default=1.0, 
 parser.add_argument("--control-reference-factor-min", type=float, default=0.8, help="minimum multiplier for native_wsd ablations")
 parser.add_argument("--control-reference-factor-max", type=float, default=1.2, help="maximum multiplier for native_wsd ablations")
 parser.add_argument("--control-start-step", type=int, default=-1, help="first controller probe/update step; -1 uses the alpha warmup boundary")
-parser.add_argument("--control-scope", type=str, default="muon_only", choices=["muon_only", "all_groups"], help="scope for alpha control: Muon matrix groups only, or all optimizer groups")
+parser.add_argument("--control-scope", type=str, default="muon_only", choices=["muon_only", "all_groups", "dual"], help="scope for alpha control: Muon-only, all groups, or opt-in dual Muon/AdamW multiplier control")
 parser.add_argument("--control-feedback-scope", type=str, default="total", choices=sorted(CONTROL_FEEDBACK_SCOPES), help="feedback observation used by the alpha controller")
 parser.add_argument("--control-absolute-group-scaling", type=str, default="uniform", choices=sorted(ABSOLUTE_GROUP_SCALING_MODES), help="uniform assigns alpha directly; initial_lr_ratio preserves native group LR ratios around Muon alpha")
 parser.add_argument("--control-period-steps", type=int, default=1, help="controller probe period; use 1 for every-step baseline")
@@ -183,6 +186,16 @@ parser.add_argument("--control-alignment-eps", type=float, default=1e-12, help="
 parser.add_argument("--control-reject-bad-steps", action="store_true", help="reserved; not supported in first nanochat implementation")
 parser.add_argument("--control-log-every", type=int, default=1, help="write controller CSV rows every N controller updates")
 parser.add_argument("--control-output-dir", type=str, default="", help="directory for local controlled optimizer metrics")
+parser.add_argument("--control-dual-allocation-kp", type=float, default=0.02, help="dual Muon/AdamW allocation proportional gain")
+parser.add_argument("--control-dual-allocation-deadband", type=float, default=0.10, help="dual allocation z-score deadband")
+parser.add_argument("--control-dual-allocation-log-min", type=float, default=-0.20, help="minimum dual relative allocation log scale")
+parser.add_argument("--control-dual-allocation-log-max", type=float, default=0.20, help="maximum dual relative allocation log scale")
+parser.add_argument("--control-dual-multiplier-min", type=float, default=0.80, help="minimum individual dual actuator multiplier")
+parser.add_argument("--control-dual-multiplier-max", type=float, default=1.20, help="maximum individual dual actuator multiplier")
+parser.add_argument("--control-dual-calibration-steps", type=int, default=25, help="dual component calibration updates before allocation can move")
+parser.add_argument("--control-dual-calibration-beta", type=float, default=0.90, help="dual component calibration EMA beta")
+parser.add_argument("--control-dual-min-contribution-fraction", type=float, default=0.05, help="minimum predicted contribution for each dual actuator")
+parser.add_argument("--control-dual-allocation-period", type=int, default=5, help="dual allocation update period in controller updates")
 parser.add_argument("--local-output-dir", type=str, default="", help="directory for local train/eval metrics for any optimizer variant")
 parser.add_argument("--control-cooldown-window-evals", type=int, default=5, help="validation observations in the robust cooldown progress window")
 parser.add_argument("--control-cooldown-patience-windows", type=int, default=2, help="consecutive low-progress windows required for cooldown")
@@ -253,6 +266,59 @@ if args.control_startup_kp >= 0 and args.control_rho_reference != "loss_progress
     raise ValueError("--control-startup-kp requires loss_progress_three_stage")
 if args.control_startup_factor_max >= 0 and args.control_rho_reference != "loss_progress_three_stage":
     raise ValueError("--control-startup-factor-max requires loss_progress_three_stage")
+dual_control_requested = args.control_scope == "dual"
+if dual_control_requested:
+    if args.optimizer_variant not in {"controlled_muon_raw", "controlled_muon_ema", "controlled_muon_ema_trust"}:
+        raise ValueError("dual control is supported only for the P controlled_muon variants")
+    if args.control_alpha_mode != "multiplier":
+        raise ValueError("dual control currently requires --control-alpha-mode=multiplier")
+    if args.control_feedback_scope != "total":
+        raise ValueError("dual control currently requires total feedback")
+    if args.control_action_policy != "legacy":
+        raise ValueError("dual control currently requires the legacy action policy")
+    if args.control_alpha_warmup_steps != 0:
+        raise ValueError("dual control currently requires zero controller alpha warmup")
+    if args.control_dual_allocation_log_min > args.control_dual_allocation_log_max:
+        raise ValueError("dual allocation log bounds must be ordered")
+    if args.control_dual_multiplier_min <= 0 or args.control_dual_multiplier_min > args.control_dual_multiplier_max:
+        raise ValueError("dual multiplier bounds must satisfy 0 < min <= max")
+    if (
+        args.control_alpha_init > 0
+        and not args.control_dual_multiplier_min
+        <= args.control_alpha_init
+        <= args.control_dual_multiplier_max
+    ):
+        raise ValueError(
+            "dual control alpha init must lie within individual multiplier bounds"
+        )
+    if (
+        args.control_alpha_min > 0
+        and not args.control_dual_multiplier_min
+        <= args.control_alpha_min
+        <= args.control_dual_multiplier_max
+    ):
+        raise ValueError(
+            "dual control alpha min must lie within individual multiplier bounds"
+        )
+    if (
+        args.control_alpha_max > 0
+        and not args.control_dual_multiplier_min
+        <= args.control_alpha_max
+        <= args.control_dual_multiplier_max
+    ):
+        raise ValueError(
+            "dual control alpha max must lie within individual multiplier bounds"
+        )
+    if (
+        args.control_alpha_min > 0
+        and args.control_alpha_max > 0
+        and args.control_alpha_min > args.control_alpha_max
+    ):
+        raise ValueError("dual control alpha bounds must be ordered")
+    if args.control_dual_calibration_steps < 0:
+        raise ValueError("dual calibration steps must be non-negative")
+    if args.control_dual_allocation_period <= 0:
+        raise ValueError("dual allocation period must be positive")
 phase_hold_enabled = args.control_action_policy in {"phase_hold", "phase_hold_recovery"}
 if phase_hold_enabled:
     if args.control_rho_reference != "loss_progress_three_stage":
@@ -604,7 +670,17 @@ if weight_decay_scaled != args.weight_decay:
 
 # -----------------------------------------------------------------------------
 # Initialize the Optimizer (combined MuonAdamW: Muon for matrix params, AdamW for rest)
-optimizer_backend = "torch_muon" if args.optimizer_variant == "torch_muon" else "native"
+requested_muon_backend = args.muon_backend
+if args.optimizer_variant == "keller_muon":
+    if requested_muon_backend not in (None, "keller_original"):
+        raise ValueError("keller_muon requires --muon-backend=keller_original when a backend is specified")
+    optimizer_backend = "keller_original"
+elif args.optimizer_variant == "torch_muon":
+    if requested_muon_backend is not None:
+        raise ValueError("torch_muon does not accept --muon-backend; it selects the torch backend itself")
+    optimizer_backend = "torch_muon"
+else:
+    optimizer_backend = requested_muon_backend or "native"
 optimizer = model.setup_optimizer(
     # AdamW hyperparameters
     unembedding_lr=args.unembedding_lr * batch_lr_scale,
@@ -669,6 +745,7 @@ elif controlled_muon_enabled and args.control_rho_reference == "loss_progress_th
         late_progress_ratio_low=args.control_rho_progress_ratio_low,
         late_minimum_observations=args.control_rho_progress_min_observations,
     )
+dual_control_enabled = controlled_muon_enabled and args.control_scope == "dual"
 controller = None
 control_output_dir = args.control_output_dir
 if controlled_muon_enabled:
@@ -678,8 +755,12 @@ if controlled_muon_enabled:
         alpha_init = 1.0
     else:
         alpha_init = args.matrix_lr * batch_lr_scale
-    alpha_min = args.control_alpha_min if args.control_alpha_min > 0 else 0.25 * alpha_init
-    alpha_max = args.control_alpha_max if args.control_alpha_max > 0 else 2.0 * alpha_init
+    if dual_control_enabled:
+        alpha_min = args.control_alpha_min if args.control_alpha_min > 0 else args.control_dual_multiplier_min
+        alpha_max = args.control_alpha_max if args.control_alpha_max > 0 else args.control_dual_multiplier_max
+    else:
+        alpha_min = args.control_alpha_min if args.control_alpha_min > 0 else 0.25 * alpha_init
+        alpha_max = args.control_alpha_max if args.control_alpha_max > 0 else 2.0 * alpha_init
     base_controller_variant = AUTONOMOUS_COOLDOWN_VARIANTS.get(args.optimizer_variant, args.optimizer_variant)
     base_controller = NanochatMuonController(
         variant=base_controller_variant,
@@ -743,7 +824,21 @@ if controlled_muon_enabled:
     )
     if not control_output_dir:
         control_output_dir = os.path.join(base_dir, "controlled_optimizer_outputs", output_dirname, args.optimizer_variant)
-    if autonomous_cooldown_enabled:
+    if dual_control_enabled:
+        controller = NanochatDualActuatorController(
+            global_controller=base_controller,
+            allocation_kp=args.control_dual_allocation_kp,
+            allocation_deadband=args.control_dual_allocation_deadband,
+            allocation_log_min=args.control_dual_allocation_log_min,
+            allocation_log_max=args.control_dual_allocation_log_max,
+            multiplier_min=args.control_dual_multiplier_min,
+            multiplier_max=args.control_dual_multiplier_max,
+            calibration_steps=args.control_dual_calibration_steps,
+            calibration_beta=args.control_dual_calibration_beta,
+            min_contribution_fraction=args.control_dual_min_contribution_fraction,
+            allocation_period=args.control_dual_allocation_period,
+        )
+    elif autonomous_cooldown_enabled:
         cooldown_detector = ValidationProgressDetector(
             window_evals=args.control_cooldown_window_evals,
             patience_windows=args.control_cooldown_patience_windows,
@@ -799,10 +894,19 @@ if local_metrics_enabled and master_process:
 if local_metrics_enabled and master_process:
     metadata_path = os.path.join(metrics_output_dir, "run_metadata.json")
     metadata = {
-        "nanochat_commit": "92d63d4e8bb4df75c3b71618f31ddde2378b2bcd",
+        "nanochat_commit": "15faeee-plus-keller-original-backend",
         "optimizer_variant": args.optimizer_variant,
         "optimizer_backend": optimizer_backend,
         "controlled_muon_enabled": controlled_muon_enabled,
+        "optimizer_backend_provenance": (
+            {
+                "repository": "https://github.com/KellerJordan/Muon",
+                "commit": "f98f1cacc0263b04290753e32be8d498c1efc806",
+                "license": "MIT",
+            }
+            if optimizer_backend == "keller_original"
+            else None
+        ),
         "control_output_dir": control_output_dir,
         "local_output_dir": metrics_output_dir,
         "user_config": user_config,
@@ -828,6 +932,13 @@ if controlled_muon_enabled and master_process:
 controller_csv_fields = [
     "step", "tokens", "alpha", "alpha_next", "alpha_update_factor", "alpha_mode",
     "control_scope", "feedback_scope",
+    "global_multiplier", "muon_multiplier", "adamw_multiplier",
+    "allocation_log_scale", "muon_contribution_fraction", "adamw_contribution_fraction",
+    "muon_component_score", "adamw_component_score",
+    "muon_component_valid", "adamw_component_valid",
+    "allocation_update_frozen", "allocation_deadband_active",
+    "muon_bound_hit", "adamw_bound_hit", "per_update_log_change_muon",
+    "per_update_log_change_adamw", "dual_calibration_count", "dual_allocation_error",
     "native_lrm", "native_muon_lr_min", "native_muon_lr_max", "muon_lr_min",
     "muon_lr_max", "adamw_lr_min", "adamw_lr_max",
     "effective_muon_lr_min", "effective_muon_lr_max",
@@ -871,6 +982,7 @@ controller_csv_fields = [
 ]
 train_csv_fields = [
     "step", "tokens", "train_loss", "smooth_train_loss", "lrm", "dt_seconds",
+    "muon_multiplier", "adamw_multiplier",
     "tok_per_sec", "mfu", "total_training_time_seconds", "alpha",
     "native_muon_lr_min", "native_muon_lr_max", "muon_lr_min", "muon_lr_max",
     "muon_lr_mean", "effective_muon_lr_mean",
@@ -1245,7 +1357,14 @@ while True:
     for group in optimizer.param_groups:
         base_lr = group["initial_lr"] * lrm
         group["lr"] = base_lr
-        if controlled_muon_enabled and args.control_scope == "all_groups":
+        if controlled_muon_enabled and args.control_scope == "dual":
+            if args.control_alpha_mode != "multiplier":
+                raise ValueError("dual control requires multiplier mode")
+            if group["kind"] == "muon":
+                group["lr"] = base_lr * controller.muon_multiplier
+            elif group["kind"] == "adamw":
+                group["lr"] = base_lr * controller.adamw_multiplier
+        elif controlled_muon_enabled and args.control_scope == "all_groups":
             if args.control_alpha_mode == "absolute":
                 scale = group.get("control_absolute_lr_scale", 1.0) if scaled_absolute_all_groups_enabled else 1.0
                 group["lr"] = control_alpha_applied * scale
@@ -1363,7 +1482,7 @@ while True:
                 if args.control_feedback_scope == "total"
                 else control_feedback.actual_for_control
             )
-            control_stats = controller.update(
+            controller_update_kwargs = dict(
                 step=step,
                 loss_before=loss_before_probe,
                 loss_after=loss_after_probe,
@@ -1378,6 +1497,16 @@ while True:
                 late_phase=float(getattr(rho_reference, "late_phase", 0.0)),
                 rho_star_override=None if rho_reference is None else rho_reference.rho_star,
             )
+            if dual_control_enabled:
+                controller_update_kwargs.update(
+                    predicted_decrease_muon=control_diagnostics["predicted_decrease_muon"],
+                    predicted_decrease_adamw=control_diagnostics["predicted_decrease_adamw"],
+                    muon_grad_norm=control_diagnostics["muon_grad_norm"],
+                    adamw_grad_norm=control_diagnostics["adamw_grad_norm"],
+                    muon_update_norm=control_diagnostics["muon_update_norm"],
+                    adamw_update_norm=control_diagnostics["adamw_update_norm"],
+                )
+            control_stats = controller.update(**controller_update_kwargs)
     model.zero_grad(set_to_none=True)
     if rho_reference is None:
         train_loss_f = train_loss.item()
@@ -1388,6 +1517,7 @@ while True:
     governed_stats = (
         controller.last_governed_stats if autonomous_cooldown_enabled else None
     )
+    dual_stats = controller.last_dual_stats if dual_control_enabled else {}
     if control_stats is not None and (controller.num_updates % args.control_log_every == 0):
         assert control_feedback is not None
         predicted_total = control_diagnostics["predicted_decrease_total"]
@@ -1405,6 +1535,24 @@ while True:
             "alpha_mode": args.control_alpha_mode,
             "control_scope": args.control_scope,
             "feedback_scope": args.control_feedback_scope,
+            "global_multiplier": dual_stats.get("global_multiplier", ""),
+            "muon_multiplier": dual_stats.get("muon_multiplier", ""),
+            "adamw_multiplier": dual_stats.get("adamw_multiplier", ""),
+            "allocation_log_scale": dual_stats.get("allocation_log_scale", ""),
+            "muon_contribution_fraction": dual_stats.get("muon_contribution_fraction", ""),
+            "adamw_contribution_fraction": dual_stats.get("adamw_contribution_fraction", ""),
+            "muon_component_score": dual_stats.get("muon_component_score", ""),
+            "adamw_component_score": dual_stats.get("adamw_component_score", ""),
+            "muon_component_valid": int(dual_stats["muon_component_valid"]) if dual_stats else "",
+            "adamw_component_valid": int(dual_stats["adamw_component_valid"]) if dual_stats else "",
+            "allocation_update_frozen": int(dual_stats["allocation_update_frozen"]) if dual_stats else "",
+            "allocation_deadband_active": int(dual_stats["allocation_deadband_active"]) if dual_stats else "",
+            "muon_bound_hit": int(dual_stats["muon_bound_hit"]) if dual_stats else "",
+            "adamw_bound_hit": int(dual_stats["adamw_bound_hit"]) if dual_stats else "",
+            "per_update_log_change_muon": dual_stats.get("per_update_log_change_muon", ""),
+            "per_update_log_change_adamw": dual_stats.get("per_update_log_change_adamw", ""),
+            "dual_calibration_count": dual_stats.get("calibration_count", ""),
+            "dual_allocation_error": dual_stats.get("allocation_error", ""),
             "native_lrm": lrm,
             "native_muon_lr_min": native_muon_lr_min,
             "native_muon_lr_max": native_muon_lr_max,
@@ -1541,6 +1689,8 @@ while True:
             "mfu": mfu,
             "total_training_time_seconds": total_training_time,
             "alpha": "" if controller is None else control_alpha_applied,
+            "muon_multiplier": "" if not dual_control_enabled else controller.muon_multiplier,
+            "adamw_multiplier": "" if not dual_control_enabled else controller.adamw_multiplier,
             "native_muon_lr_min": native_muon_lr_min,
             "native_muon_lr_max": native_muon_lr_max,
             "muon_lr_min": muon_lr_min,

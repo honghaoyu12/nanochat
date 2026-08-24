@@ -454,6 +454,8 @@ class GPT(nn.Module):
 
         if backend == 'native':
             optimizer = MuonAdamW(param_groups)
+        elif backend == 'keller_original':
+            optimizer = MuonAdamW(param_groups, muon_backend='keller_original')
         elif backend == 'torch_muon':
             optimizer = TorchMuonAdamW(param_groups)
         else:

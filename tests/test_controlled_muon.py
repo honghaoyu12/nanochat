@@ -8,6 +8,7 @@ from nanochat.controlled_muon import (
     select_control_feedback,
     validate_control_feedback_configuration,
 )
+from nanochat.dual_controller import NanochatDualActuatorController
 
 
 @pytest.mark.parametrize("control_scope", ["muon_only", "all_groups"])
@@ -722,3 +723,122 @@ def test_three_stage_reference_moves_startup_then_late_and_roundtrips():
     assert restored.rho_star == pytest.approx(reference.rho_star)
     assert restored.startup_phase == pytest.approx(reference.startup_phase)
     assert restored.late_phase == pytest.approx(reference.late_phase)
+
+
+def _make_dual(**overrides):
+    config = {
+        "allocation_kp": 0.05,
+        "allocation_deadband": 0.0,
+        "allocation_log_min": -0.2,
+        "allocation_log_max": 0.2,
+        "multiplier_min": 0.8,
+        "multiplier_max": 1.2,
+        "calibration_steps": 1,
+        "allocation_period": 1,
+    }
+    config.update(overrides)
+    global_alpha_min = config.pop("global_alpha_min", 0.8)
+    global_alpha_max = config.pop("global_alpha_max", 1.2)
+    global_controller = NanochatMuonController(
+        variant="controlled_muon_ema",
+        alpha_init=1.0,
+        alpha_min=global_alpha_min,
+        alpha_max=global_alpha_max,
+        rho_star=0.7,
+        kp=0.02,
+        factor_min=0.9,
+        factor_max=1.1,
+    )
+    return NanochatDualActuatorController(
+        global_controller=global_controller,
+        **config,
+    )
+
+
+def _dual_update(
+    controller,
+    muon_prediction,
+    adamw_prediction,
+    valid=True,
+    actual_decrease=0.05,
+):
+    return controller.update(
+        step=controller.num_updates,
+        loss_before=1.0,
+        loss_after=0.95,
+        predicted_decrease=muon_prediction + adamw_prediction,
+        grad_norm=1.0,
+        update_norm=0.1,
+        feedback_actual_decrease=actual_decrease,
+        feedback_observation_valid=valid,
+        predicted_decrease_muon=muon_prediction,
+        predicted_decrease_adamw=adamw_prediction,
+        muon_grad_norm=1.0,
+        adamw_grad_norm=1.0,
+        muon_update_norm=0.1,
+        adamw_update_norm=0.1,
+    )
+
+
+def test_dual_zero_allocation_matches_shared_multiplier():
+    controller = _make_dual()
+    assert controller.muon_multiplier == pytest.approx(controller.alpha)
+    assert controller.adamw_multiplier == pytest.approx(controller.alpha)
+    controller.allocation_log_scale = 0.0
+    controller._recompute_multipliers()
+    assert controller.muon_multiplier == pytest.approx(controller.alpha)
+    assert controller.adamw_multiplier == pytest.approx(controller.alpha)
+
+
+def test_dual_allocation_separates_actuators_and_respects_bounds():
+    controller = _make_dual()
+    _dual_update(controller, 0.05, 0.05)
+    _dual_update(controller, 0.08, 0.02)
+    assert controller.muon_multiplier != pytest.approx(controller.adamw_multiplier)
+    assert 0.8 <= controller.muon_multiplier <= 1.2
+    assert 0.8 <= controller.adamw_multiplier <= 1.2
+    assert controller.last_dual_stats["allocation_update_frozen"] is False
+
+
+def test_dual_invalid_component_signal_freezes_allocation():
+    controller = _make_dual()
+    _dual_update(controller, 0.05, 0.05)
+    _dual_update(controller, 0.08, 0.02)
+    before = controller.allocation_log_scale
+    _dual_update(controller, float("nan"), 0.02, valid=False)
+    assert controller.allocation_log_scale == pytest.approx(before)
+    assert controller.last_dual_stats["allocation_update_frozen"] is True
+
+
+def test_dual_intrinsically_rejected_global_observation_freezes_allocation():
+    controller = _make_dual()
+    _dual_update(controller, 0.05, 0.05)
+    _dual_update(controller, 0.08, 0.02)
+    before = controller.allocation_log_scale
+    stats = _dual_update(
+        controller,
+        0.08,
+        0.02,
+        actual_decrease=float("nan"),
+    )
+    assert stats.skipped_reason == "nonfinite_loss_or_rho"
+    assert controller.allocation_log_scale == pytest.approx(before)
+    assert controller.last_dual_stats["allocation_update_frozen"] is True
+
+
+def test_dual_rejects_global_bounds_outside_actuator_bounds():
+    with pytest.raises(ValueError, match="global controller alpha bounds"):
+        _make_dual(global_alpha_min=0.7)
+    with pytest.raises(ValueError, match="global controller alpha bounds"):
+        _make_dual(global_alpha_max=1.3)
+
+
+def test_dual_state_round_trip_preserves_actuators():
+    controller = _make_dual()
+    _dual_update(controller, 0.05, 0.05)
+    _dual_update(controller, 0.08, 0.02)
+    restored = _make_dual()
+    restored.load_state_dict(controller.state_dict())
+    assert restored.allocation_log_scale == pytest.approx(controller.allocation_log_scale)
+    assert restored.muon_multiplier == pytest.approx(controller.muon_multiplier)
+    assert restored.adamw_multiplier == pytest.approx(controller.adamw_multiplier)

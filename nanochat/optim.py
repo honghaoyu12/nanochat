@@ -107,6 +107,9 @@ polar_express_coeffs = [
     (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
 ]
 
+KELLER_MUON_REFERENCE_COMMIT = "f98f1cacc0263b04290753e32be8d498c1efc806"
+KELLER_NS_COEFFICIENTS = (3.4445, -4.7750, 2.0315)
+
 
 @torch.compile(dynamic=False, fullgraph=True)
 def muon_step_fused(
@@ -178,6 +181,41 @@ def muon_step_fused(
     wd = wd_t.to(g.dtype)
     mask = (g * stacked_params) >= 0
     stacked_params.sub_(lr * g + lr * wd * stacked_params * mask)
+
+
+@torch.compile(dynamic=False, fullgraph=True)
+def keller_muon_step_fused(
+    stacked_grads: Tensor,
+    stacked_params: Tensor,
+    momentum_buffer: Tensor,
+    momentum_t: Tensor,
+    lr_t: Tensor,
+    wd_t: Tensor,
+    ns_steps: int,
+) -> None:
+    """Pinned KellerJordan/Muon update, executed on Nanochat's stacked tensors."""
+    momentum = momentum_t.to(stacked_grads.dtype)
+    momentum_buffer.lerp_(stacked_grads, 1 - momentum)
+    g = stacked_grads.lerp_(momentum_buffer, momentum)
+
+    X = g.bfloat16()
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
+    transpose = X.size(-2) > X.size(-1)
+    if transpose:
+        X = X.mT
+    a, b, c = KELLER_NS_COEFFICIENTS
+    for _ in range(ns_steps):
+        A = X @ X.mT
+        B = b * A + c * (A @ A)
+        X = a * X + B @ X
+    if transpose:
+        X = X.mT
+
+    lr = lr_t.to(stacked_params.dtype)
+    wd = wd_t.to(stacked_params.dtype)
+    shape_scale = max(1.0, stacked_params.size(-2) / stacked_params.size(-1)) ** 0.5
+    stacked_params.mul_(1 - lr * wd)
+    stacked_params.sub_(lr * shape_scale * X.to(stacked_params.dtype))
 
 # -----------------------------------------------------------------------------
 
@@ -257,8 +295,16 @@ class MuonAdamW(torch.optim.Optimizer):
             - For AdamW groups: 'lr', 'betas', 'eps', 'weight_decay'
             - For Muon groups: 'lr', 'momentum', 'ns_steps', 'beta2', 'weight_decay'
     """
-    def __init__(self, param_groups: list[dict]):
+    VALID_MUON_BACKENDS = frozenset({"nanochat_enhanced", "keller_original"})
+
+    def __init__(self, param_groups: list[dict], muon_backend: str = "nanochat_enhanced"):
+        if muon_backend not in self.VALID_MUON_BACKENDS:
+            raise ValueError(
+                f"unknown Muon backend: {muon_backend}; "
+                f"expected one of {sorted(self.VALID_MUON_BACKENDS)}"
+            )
         super().__init__(param_groups, defaults={})
+        self.muon_backend = muon_backend
         # 0-D CPU tensors to avoid torch.compile recompilation when values change
         self._adamw_step_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._adamw_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
@@ -461,7 +507,7 @@ class MuonAdamW(torch.optim.Optimizer):
         state = self.state[p]
         if "momentum_buffer" not in state:
             state["momentum_buffer"] = torch.zeros(chunk_size, *shape, dtype=dtype, device=device)
-        if "second_momentum_buffer" not in state:
+        if self.muon_backend == "nanochat_enhanced" and "second_momentum_buffer" not in state:
             state_shape = (chunk_size, shape[-2], 1) if shape[-2] >= shape[-1] else (chunk_size, 1, shape[-1])
             state["second_momentum_buffer"] = torch.zeros(state_shape, dtype=dtype, device=device)
         red_dim = -1 if shape[-2] >= shape[-1] else -2
@@ -477,15 +523,23 @@ class MuonAdamW(torch.optim.Optimizer):
 
             # Fill 0-D tensors and run fused kernel
             self._muon_momentum_t.fill_(group["momentum"])
-            self._muon_beta2_t.fill_(group["beta2"])
-            self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1])**0.5)
             self._muon_wd_t.fill_(group["weight_decay"])
-            muon_step_fused(
-                grad_chunk[:num_owned], stacked_owned,
-                state["momentum_buffer"][:num_owned], state["second_momentum_buffer"][:num_owned],
-                self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t, self._muon_beta2_t,
-                group["ns_steps"], red_dim,
-            )
+            if self.muon_backend == "keller_original":
+                self._muon_lr_t.fill_(group["lr"])
+                keller_muon_step_fused(
+                    grad_chunk[:num_owned], stacked_owned,
+                    state["momentum_buffer"][:num_owned], self._muon_momentum_t,
+                    self._muon_lr_t, self._muon_wd_t, group["ns_steps"],
+                )
+            else:
+                self._muon_beta2_t.fill_(group["beta2"])
+                self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1])**0.5)
+                muon_step_fused(
+                    grad_chunk[:num_owned], stacked_owned,
+                    state["momentum_buffer"][:num_owned], state["second_momentum_buffer"][:num_owned],
+                    self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t, self._muon_beta2_t,
+                    group["ns_steps"], red_dim,
+                )
 
             if capture_diagnostics:
                 delta = stacked_owned.detach() - p_before
