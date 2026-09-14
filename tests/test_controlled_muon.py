@@ -3,12 +3,24 @@
 import pytest
 
 from nanochat.controlled_muon import (
+    CONTROL_FEEDBACK_SCOPES,
     NanochatMuonController,
     ThreeStageLossProgressRhoReference,
     select_control_feedback,
     validate_control_feedback_configuration,
 )
 from nanochat.dual_controller import NanochatDualActuatorController
+
+
+def test_causal_feedback_is_an_explicit_independent_scope():
+    assert "causal_component" in CONTROL_FEEDBACK_SCOPES
+    validate_control_feedback_configuration(
+        scope="causal_component", controlled=True, control_scope="causal_dual"
+    )
+    with pytest.raises(ValueError, match="control-scope=causal_dual"):
+        validate_control_feedback_configuration(
+            scope="causal_component", controlled=True, control_scope="dual"
+        )
 
 
 @pytest.mark.parametrize("control_scope", ["muon_only", "all_groups"])

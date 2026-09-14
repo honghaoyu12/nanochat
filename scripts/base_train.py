@@ -46,7 +46,13 @@ from nanochat.controlled_muon import (
     validate_control_feedback_configuration,
     validate_resumed_control_feedback,
 )
+from nanochat.causal_dual_controller import (
+    NanochatCausalDualActuatorController,
+    evaluate_causal_component_probe,
+    snapshot_optimizer_parameters,
+)
 from nanochat.dual_controller import NanochatDualActuatorController
+from nanochat.control_cadence import ControlCadence
 from nanochat.control_governors import (
     AUTONOMOUS_COOLDOWN_VARIANTS,
     AlphaCeilingGovernor,
@@ -112,10 +118,16 @@ parser.add_argument("--control-reference-factor-init", type=float, default=1.0, 
 parser.add_argument("--control-reference-factor-min", type=float, default=0.8, help="minimum multiplier for native_wsd ablations")
 parser.add_argument("--control-reference-factor-max", type=float, default=1.2, help="maximum multiplier for native_wsd ablations")
 parser.add_argument("--control-start-step", type=int, default=-1, help="first controller probe/update step; -1 uses the alpha warmup boundary")
-parser.add_argument("--control-scope", type=str, default="muon_only", choices=["muon_only", "all_groups", "dual"], help="scope for alpha control: Muon-only, all groups, or opt-in dual Muon/AdamW multiplier control")
+parser.add_argument("--control-scope", type=str, default="muon_only", choices=["muon_only", "all_groups", "dual", "causal_dual"], help="scope for alpha control: Muon-only, all groups, legacy dual, or causal dual Muon/AdamW multiplier control")
 parser.add_argument("--control-feedback-scope", type=str, default="total", choices=sorted(CONTROL_FEEDBACK_SCOPES), help="feedback observation used by the alpha controller")
 parser.add_argument("--control-absolute-group-scaling", type=str, default="uniform", choices=sorted(ABSOLUTE_GROUP_SCALING_MODES), help="uniform assigns alpha directly; initial_lr_ratio preserves native group LR ratios around Muon alpha")
 parser.add_argument("--control-period-steps", type=int, default=1, help="controller probe period; use 1 for every-step baseline")
+parser.add_argument(
+    "--control-period-schedule",
+    type=str,
+    default="",
+    help="optional controller-relative phased probe cadence, e.g. 0:5,1000:20,2400:100",
+)
 parser.add_argument("--control-probe-scope", type=str, default="full_accum_batch", choices=["full_accum_batch", "last_microbatch"], help="tokens used for before/after probe loss")
 parser.add_argument("--control-alpha-warmup-steps", type=int, default=0, help="linearly warm up applied absolute alpha over this many steps")
 parser.add_argument("--control-alpha-init", type=float, default=-1.0, help="initial alpha; -1 uses matrix_lr after batch scaling")
@@ -123,6 +135,8 @@ parser.add_argument("--control-alpha-min", type=float, default=-1.0, help="minim
 parser.add_argument("--control-alpha-max", type=float, default=-1.0, help="maximum alpha; -1 uses 2.0 * alpha_init")
 parser.add_argument("--control-alpha-replay-file", type=str, default="", help="reserved absolute alpha replay source")
 parser.add_argument("--control-residual-validity-gate", action="store_true", help="reject low-observability Muon residual probes before rho EMA")
+parser.add_argument("--control-causal-rho-beta", type=float, default=0.9, help="EMA beta for causal Muon/AdamW response ratios")
+parser.add_argument("--control-causal-interaction-max-ratio", type=float, default=1.0, help="maximum interaction residual ratio that permits causal allocation updates")
 parser.add_argument("--control-residual-min-muon-predicted-fraction", type=float, default=0.10, help="minimum predicted Muon fraction for residual feedback validity")
 parser.add_argument("--control-residual-max-adamw-predicted-fraction", type=float, default=0.90, help="maximum predicted AdamW fraction for residual feedback validity")
 parser.add_argument("--control-startup-alpha-reference-ratio", type=float, default=1.0, help="opt-in autonomous startup alpha target as a multiple of alpha init; 1 disables")
@@ -267,6 +281,7 @@ if args.control_startup_kp >= 0 and args.control_rho_reference != "loss_progress
 if args.control_startup_factor_max >= 0 and args.control_rho_reference != "loss_progress_three_stage":
     raise ValueError("--control-startup-factor-max requires loss_progress_three_stage")
 dual_control_requested = args.control_scope == "dual"
+causal_dual_requested = args.control_scope == "causal_dual"
 if dual_control_requested:
     if args.optimizer_variant not in {"controlled_muon_raw", "controlled_muon_ema", "controlled_muon_ema_trust"}:
         raise ValueError("dual control is supported only for the P controlled_muon variants")
@@ -319,6 +334,25 @@ if dual_control_requested:
         raise ValueError("dual calibration steps must be non-negative")
     if args.control_dual_allocation_period <= 0:
         raise ValueError("dual allocation period must be positive")
+if causal_dual_requested:
+    if args.optimizer_variant not in {"controlled_muon_raw", "controlled_muon_ema", "controlled_muon_ema_trust"}:
+        raise ValueError("causal dual control is supported only for the P controlled_muon variants")
+    if args.control_alpha_mode != "multiplier":
+        raise ValueError("causal dual control currently requires --control-alpha-mode=multiplier")
+    if args.control_feedback_scope != "causal_component":
+        raise ValueError("causal dual control requires --control-feedback-scope=causal_component")
+    if args.control_action_policy != "legacy":
+        raise ValueError("causal dual control currently requires the legacy action policy")
+    if args.control_alpha_warmup_steps != 0:
+        raise ValueError("causal dual control currently requires zero controller alpha warmup")
+    if args.control_dual_allocation_log_min > args.control_dual_allocation_log_max:
+        raise ValueError("causal dual allocation log bounds must be ordered")
+    if args.control_dual_multiplier_min <= 0 or args.control_dual_multiplier_min > args.control_dual_multiplier_max:
+        raise ValueError("causal dual multiplier bounds must satisfy 0 < min <= max")
+    if not 0 <= args.control_causal_rho_beta < 1:
+        raise ValueError("causal rho beta must be in [0, 1)")
+    if args.control_causal_interaction_max_ratio < 0 or not math.isfinite(args.control_causal_interaction_max_ratio):
+        raise ValueError("causal interaction max ratio must be finite and non-negative")
 phase_hold_enabled = args.control_action_policy in {"phase_hold", "phase_hold_recovery"}
 if phase_hold_enabled:
     if args.control_rho_reference != "loss_progress_three_stage":
@@ -371,6 +405,15 @@ if args.control_alpha_replay_file:
     raise ValueError("--control-alpha-replay-file is reserved and not enabled for this launch path")
 if args.control_period_steps <= 0:
     raise ValueError("--control-period-steps must be positive")
+control_cadence = ControlCadence.from_spec(
+    args.control_period_schedule,
+    fixed_period=args.control_period_steps,
+)
+args.control_period_schedule = control_cadence.canonical_spec
+print0(
+    f"Controller cadence: "
+    f"{control_cadence.canonical_spec or f'fixed:{control_cadence.fixed_period}'}"
+)
 if args.control_log_every <= 0:
     raise ValueError("--control-log-every must be positive")
 if args.local_log_every <= 0:
@@ -746,6 +789,8 @@ elif controlled_muon_enabled and args.control_rho_reference == "loss_progress_th
         late_minimum_observations=args.control_rho_progress_min_observations,
     )
 dual_control_enabled = controlled_muon_enabled and args.control_scope == "dual"
+causal_dual_control_enabled = controlled_muon_enabled and args.control_scope == "causal_dual"
+dual_actuator_control_enabled = dual_control_enabled or causal_dual_control_enabled
 controller = None
 control_output_dir = args.control_output_dir
 if controlled_muon_enabled:
@@ -755,7 +800,7 @@ if controlled_muon_enabled:
         alpha_init = 1.0
     else:
         alpha_init = args.matrix_lr * batch_lr_scale
-    if dual_control_enabled:
+    if dual_actuator_control_enabled:
         alpha_min = args.control_alpha_min if args.control_alpha_min > 0 else args.control_dual_multiplier_min
         alpha_max = args.control_alpha_max if args.control_alpha_max > 0 else args.control_dual_multiplier_max
     else:
@@ -838,6 +883,19 @@ if controlled_muon_enabled:
             min_contribution_fraction=args.control_dual_min_contribution_fraction,
             allocation_period=args.control_dual_allocation_period,
         )
+    elif causal_dual_control_enabled:
+        controller = NanochatCausalDualActuatorController(
+            global_controller=base_controller,
+            allocation_kp=args.control_dual_allocation_kp,
+            allocation_deadband=args.control_dual_allocation_deadband,
+            allocation_log_min=args.control_dual_allocation_log_min,
+            allocation_log_max=args.control_dual_allocation_log_max,
+            multiplier_min=args.control_dual_multiplier_min,
+            multiplier_max=args.control_dual_multiplier_max,
+            rho_beta=args.control_causal_rho_beta,
+            interaction_max_ratio=args.control_causal_interaction_max_ratio,
+            allocation_period=args.control_dual_allocation_period,
+        )
     elif autonomous_cooldown_enabled:
         cooldown_detector = ValidationProgressDetector(
             window_evals=args.control_cooldown_window_evals,
@@ -883,6 +941,10 @@ if controlled_muon_enabled:
                 "controlled_muon_feedback"
             ),
         )
+        control_cadence.validate_resume(
+            meta_data.get("control_cadence")
+            or meta_data.get("user_config", {}).get("control_cadence")
+        )
 
 metrics_output_dir = args.local_output_dir
 if controlled_muon_enabled and not metrics_output_dir:
@@ -922,6 +984,7 @@ if local_metrics_enabled and master_process:
         "control_feedback": control_feedback_state_dict(args.control_feedback_scope),
         "control_rho_reference": args.control_rho_reference,
         "rho_reference": None if rho_reference is None else rho_reference.state_dict(),
+        "control_cadence": control_cadence.state_dict(),
     }
     with open(metadata_path, "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2)
@@ -932,6 +995,7 @@ if controlled_muon_enabled and master_process:
 controller_csv_fields = [
     "step", "tokens", "alpha", "alpha_next", "alpha_update_factor", "alpha_mode",
     "control_scope", "feedback_scope",
+    "control_period_steps", "control_period_schedule", "probe_count",
     "global_multiplier", "muon_multiplier", "adamw_multiplier",
     "allocation_log_scale", "muon_contribution_fraction", "adamw_contribution_fraction",
     "muon_component_score", "adamw_component_score",
@@ -939,8 +1003,14 @@ controller_csv_fields = [
     "allocation_update_frozen", "allocation_deadband_active",
     "muon_bound_hit", "adamw_bound_hit", "per_update_log_change_muon",
     "per_update_log_change_adamw", "dual_calibration_count", "dual_allocation_error",
+    "causal_rho_muon", "causal_rho_adamw", "causal_rho_muon_ema",
+    "causal_rho_adamw_ema", "causal_interaction_residual",
+    "causal_interaction_ratio", "causal_component_valid", "causal_invalid_reason",
+    "causal_allocation_update_frozen", "causal_allocation_deadband_active",
+    "causal_allocation_log_scale", "causal_allocation_error",
     "native_lrm", "native_muon_lr_min", "native_muon_lr_max", "muon_lr_min",
     "muon_lr_max", "adamw_lr_min", "adamw_lr_max",
+    "causal_muon_bound_hit", "causal_adamw_bound_hit",
     "effective_muon_lr_min", "effective_muon_lr_max",
     "effective_muon_lr_mean", "rho", "rho_clipped", "rho_ema", "rho_control",
     "rho_star_applied", "rho_reference_mode",
@@ -982,6 +1052,7 @@ controller_csv_fields = [
 ]
 train_csv_fields = [
     "step", "tokens", "train_loss", "smooth_train_loss", "lrm", "dt_seconds",
+    "control_period_steps", "control_period_schedule", "probe_this_step", "probe_count",
     "muon_multiplier", "adamw_multiplier",
     "tok_per_sec", "mfu", "total_training_time_seconds", "alpha",
     "native_muon_lr_min", "native_muon_lr_max", "muon_lr_min", "muon_lr_max",
@@ -1127,6 +1198,7 @@ if not resuming:
     min_val_bpb = float("inf")
     smooth_train_loss = 0 # EMA of training loss
     total_training_time = 0 # total wall-clock time of training
+    probe_count = 0
 else:
     step = meta_data["step"]
     loop_state = meta_data["loop_state"]
@@ -1134,6 +1206,7 @@ else:
     min_val_bpb = loop_state["min_val_bpb"]
     smooth_train_loss = loop_state["smooth_train_loss"]
     total_training_time = loop_state["total_training_time"]
+    probe_count = int(loop_state.get("control_probe_count", 0))
 
 # Figure out the needed gradient accumulation micro-steps to reach the desired total batch size per step
 tokens_per_fwdbwd = args.device_batch_size * args.max_seq_len # tokens per iteration for a single rank
@@ -1290,6 +1363,7 @@ while True:
                 "device_batch_size": args.device_batch_size,
                 "max_seq_len": args.max_seq_len,
                 "total_batch_size": total_batch_size,
+                "control_cadence": control_cadence.state_dict(),
                 "dataloader_state_dict": dataloader_state_dict,
                 "loop_state": { # all loop state (other than step) so that we can resume training
                     "min_val_bpb": min_val_bpb,
@@ -1298,6 +1372,7 @@ while True:
                     "controlled_muon_controller": None if controller is None else controller.state_dict(),
                     "controlled_muon_feedback": None if controller is None else control_feedback_state_dict(args.control_feedback_scope),
                     "controlled_muon_rho_reference": None if rho_reference is None else rho_reference.state_dict(),
+                    "control_probe_count": probe_count,
                 },
             },
             rank=ddp_rank,
@@ -1313,7 +1388,16 @@ while True:
     synchronize()
     t0 = time.time()
     control_active = controlled_muon_enabled and step >= args.control_start_step
-    probe_this_step = control_active and ((step - args.control_start_step) % args.control_period_steps == 0)
+    active_control_period = control_cadence.active_period(
+        step=step,
+        control_start_step=args.control_start_step,
+    )
+    probe_this_step = control_active and control_cadence.is_probe_step(
+        step=step,
+        control_start_step=args.control_start_step,
+    )
+    if probe_this_step:
+        probe_count += 1
     probe_batches = []
     loss_before_probe_sum = 0.0
     loss_before_probe_count = 0
@@ -1357,7 +1441,7 @@ while True:
     for group in optimizer.param_groups:
         base_lr = group["initial_lr"] * lrm
         group["lr"] = base_lr
-        if controlled_muon_enabled and args.control_scope == "dual":
+        if controlled_muon_enabled and args.control_scope in {"dual", "causal_dual"}:
             if args.control_alpha_mode != "multiplier":
                 raise ValueError("dual control requires multiplier mode")
             if group["kind"] == "muon":
@@ -1405,6 +1489,7 @@ while True:
     if probe_this_step:
         optimizer.set_control_diagnostics(True, include_adamw=True)
     step_skipped_by_scaler = False
+    pre_update_parameters = snapshot_optimizer_parameters(optimizer) if probe_this_step and causal_dual_control_enabled else None
     if scaler is not None:
         scaler.unscale_(optimizer)
         # In distributed training, all ranks must agree on whether to skip the step.
@@ -1423,12 +1508,31 @@ while True:
         control_diagnostics = optimizer.consume_control_diagnostics(all_reduce=True)
         if not step_skipped_by_scaler:
             loss_before_probe = loss_before_probe_sum / max(1, loss_before_probe_count)
-            loss_after_probe = _average_probe_loss(model, probe_batches)
-            loss_before_probe = _all_reduce_mean_scalar(loss_before_probe, device)
-            loss_after_probe = _all_reduce_mean_scalar(loss_after_probe, device)
+            causal_probe_result = None
+            if causal_dual_control_enabled:
+                if pre_update_parameters is None:
+                    raise RuntimeError("causal probe is missing pre-update parameters")
+                causal_probe_result = evaluate_causal_component_probe(
+                    model=model,
+                    optimizer=optimizer,
+                    probe_batches=probe_batches,
+                    pre_update_parameters=pre_update_parameters,
+                )
+                causal_probe_result = causal_probe_result.__class__(
+                    loss_pre=_all_reduce_mean_scalar(causal_probe_result.loss_pre, device),
+                    loss_total=_all_reduce_mean_scalar(causal_probe_result.loss_total, device),
+                    loss_muon=_all_reduce_mean_scalar(causal_probe_result.loss_muon, device),
+                    loss_adamw=_all_reduce_mean_scalar(causal_probe_result.loss_adamw, device),
+                )
+                loss_before_probe = causal_probe_result.loss_pre
+                loss_after_probe = causal_probe_result.loss_total
+            else:
+                loss_after_probe = _average_probe_loss(model, probe_batches)
+                loss_before_probe = _all_reduce_mean_scalar(loss_before_probe, device)
+                loss_after_probe = _all_reduce_mean_scalar(loss_after_probe, device)
             actual_total = loss_before_probe - loss_after_probe
             control_feedback = select_control_feedback(
-                scope=args.control_feedback_scope,
+                scope="total" if causal_dual_control_enabled else args.control_feedback_scope,
                 actual_total=actual_total,
                 predicted_total=control_diagnostics["predicted_decrease_total"],
                 predicted_muon=control_diagnostics["predicted_decrease_muon"],
@@ -1506,6 +1610,17 @@ while True:
                     muon_update_norm=control_diagnostics["muon_update_norm"],
                     adamw_update_norm=control_diagnostics["adamw_update_norm"],
                 )
+            elif causal_dual_control_enabled:
+                if causal_probe_result is None:
+                    raise RuntimeError("causal controller is missing causal probe results")
+                controller_update_kwargs.update(
+                    actual_decrease_muon=causal_probe_result.actual_decrease_muon,
+                    actual_decrease_adamw=causal_probe_result.actual_decrease_adamw,
+                    actual_decrease_total=causal_probe_result.actual_decrease_total,
+                    interaction_residual=causal_probe_result.interaction_residual,
+                    predicted_decrease_muon=control_diagnostics["predicted_decrease_muon"],
+                    predicted_decrease_adamw=control_diagnostics["predicted_decrease_adamw"],
+                )
             control_stats = controller.update(**controller_update_kwargs)
     model.zero_grad(set_to_none=True)
     if rho_reference is None:
@@ -1517,8 +1632,13 @@ while True:
     governed_stats = (
         controller.last_governed_stats if autonomous_cooldown_enabled else None
     )
-    dual_stats = controller.last_dual_stats if dual_control_enabled else {}
+    dual_stats = (
+        controller.last_dual_stats if dual_control_enabled
+        else controller.last_causal_stats if causal_dual_control_enabled
+        else {}
+    )
     if control_stats is not None and (controller.num_updates % args.control_log_every == 0):
+        causal_stats = controller.last_causal_stats if causal_dual_control_enabled else {}
         assert control_feedback is not None
         predicted_total = control_diagnostics["predicted_decrease_total"]
         adamw_predicted_fraction = (
@@ -1535,6 +1655,9 @@ while True:
             "alpha_mode": args.control_alpha_mode,
             "control_scope": args.control_scope,
             "feedback_scope": args.control_feedback_scope,
+            "control_period_steps": active_control_period,
+            "control_period_schedule": control_cadence.canonical_spec,
+            "probe_count": probe_count,
             "global_multiplier": dual_stats.get("global_multiplier", ""),
             "muon_multiplier": dual_stats.get("muon_multiplier", ""),
             "adamw_multiplier": dual_stats.get("adamw_multiplier", ""),
@@ -1554,6 +1677,20 @@ while True:
             "dual_calibration_count": dual_stats.get("calibration_count", ""),
             "dual_allocation_error": dual_stats.get("allocation_error", ""),
             "native_lrm": lrm,
+            "causal_rho_muon": causal_stats.get("causal_rho_muon", ""),
+            "causal_rho_adamw": causal_stats.get("causal_rho_adamw", ""),
+            "causal_rho_muon_ema": causal_stats.get("causal_rho_muon_ema", ""),
+            "causal_rho_adamw_ema": causal_stats.get("causal_rho_adamw_ema", ""),
+            "causal_interaction_residual": causal_stats.get("causal_interaction_residual", ""),
+            "causal_interaction_ratio": causal_stats.get("causal_interaction_ratio", ""),
+            "causal_component_valid": int(causal_stats["causal_component_valid"]) if causal_stats else "",
+            "causal_invalid_reason": causal_stats.get("causal_invalid_reason", ""),
+            "causal_allocation_update_frozen": int(causal_stats["allocation_update_frozen"]) if causal_stats else "",
+            "causal_allocation_deadband_active": int(causal_stats["allocation_deadband_active"]) if causal_stats else "",
+            "causal_allocation_log_scale": causal_stats.get("allocation_log_scale", ""),
+            "causal_allocation_error": causal_stats.get("allocation_error", ""),
+            "causal_muon_bound_hit": int(causal_stats["muon_bound_hit"]) if causal_stats else "",
+            "causal_adamw_bound_hit": int(causal_stats["adamw_bound_hit"]) if causal_stats else "",
             "native_muon_lr_min": native_muon_lr_min,
             "native_muon_lr_max": native_muon_lr_max,
             "muon_lr_min": muon_lr_min,
@@ -1685,12 +1822,16 @@ while True:
             "smooth_train_loss": debiased_smooth_loss,
             "lrm": lrm,
             "dt_seconds": dt,
+            "control_period_steps": active_control_period,
+            "control_period_schedule": control_cadence.canonical_spec,
+            "probe_this_step": int(probe_this_step),
+            "probe_count": probe_count,
             "tok_per_sec": tok_per_sec,
             "mfu": mfu,
             "total_training_time_seconds": total_training_time,
             "alpha": "" if controller is None else control_alpha_applied,
-            "muon_multiplier": "" if not dual_control_enabled else controller.muon_multiplier,
-            "adamw_multiplier": "" if not dual_control_enabled else controller.adamw_multiplier,
+            "muon_multiplier": "" if not dual_actuator_control_enabled else controller.muon_multiplier,
+            "adamw_multiplier": "" if not dual_actuator_control_enabled else controller.adamw_multiplier,
             "native_muon_lr_min": native_muon_lr_min,
             "native_muon_lr_max": native_muon_lr_max,
             "muon_lr_min": muon_lr_min,

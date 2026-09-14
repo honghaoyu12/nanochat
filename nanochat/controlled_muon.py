@@ -16,7 +16,7 @@ def _clip(value: float, lower: float, upper: float) -> float:
 
 
 ABSOLUTE_GROUP_SCALING_MODES = {"uniform", "initial_lr_ratio"}
-CONTROL_FEEDBACK_SCOPES = {"total", "muon_residual_proxy"}
+CONTROL_FEEDBACK_SCOPES = {"total", "muon_residual_proxy", "causal_component"}
 CONTROL_ACTION_POLICIES = {"legacy", "phase_hold", "phase_hold_recovery"}
 PHASE_HOLD_CRUISE_POLICIES = {"hold", "rho_deadband"}
 CONTROL_FEEDBACK_STATE_SCHEMA_VERSION = 1
@@ -62,6 +62,10 @@ def select_control_feedback(
     """Select the observation consumed by the scalar alpha controller."""
     if scope not in CONTROL_FEEDBACK_SCOPES:
         raise ValueError(f"unknown control feedback scope: {scope}")
+    if scope == "causal_component":
+        raise ValueError(
+            "causal_component feedback requires counterfactual component observations"
+        )
 
     actual_total_f = float(actual_total)
     predicted_total_f = float(predicted_total)
@@ -99,6 +103,10 @@ def validate_control_feedback_configuration(
     if scope not in CONTROL_FEEDBACK_SCOPES:
         raise ValueError(f"unknown control feedback scope: {scope}")
     if scope == "total":
+        return
+    if scope == "causal_component":
+        if not controlled or control_scope != "causal_dual":
+            raise ValueError("causal_component feedback requires control-scope=causal_dual")
         return
     if not controlled:
         raise ValueError("muon_residual_proxy feedback requires a controlled optimizer")
