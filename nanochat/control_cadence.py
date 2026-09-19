@@ -3,9 +3,32 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 
 
 CadenceEntry = tuple[int, int]
+
+
+def select_probe_microbatch_indices(
+    num_microbatches: int, fraction: float, step: int
+) -> tuple[int, ...]:
+    """Select a deterministic rotating subset for a same-batch probe.
+
+    The selected indices are spread across the accumulation window and rotate
+    with the optimizer step, so fractional probes do not always observe the
+    same microbatch position. Fraction is rounded to the nearest whole
+    microbatch and at least one microbatch is retained.
+    """
+    if num_microbatches <= 0:
+        raise ValueError("num_microbatches must be positive")
+    if not math.isfinite(fraction) or not 0.0 < fraction <= 1.0:
+        raise ValueError("probe fraction must be finite and in (0, 1]")
+    count = max(1, min(num_microbatches, int(round(num_microbatches * fraction))))
+    if count == num_microbatches:
+        return tuple(range(num_microbatches))
+    offset = int(step) % num_microbatches
+    indices = {(offset + (i * num_microbatches) // count) % num_microbatches for i in range(count)}
+    return tuple(sorted(indices))
 
 
 @dataclass(frozen=True)

@@ -2,7 +2,7 @@
 
 import pytest
 
-from nanochat.control_cadence import ControlCadence
+from nanochat.control_cadence import ControlCadence, select_probe_microbatch_indices
 
 
 def test_fixed_period_preserves_legacy_relative_step_behavior():
@@ -66,3 +66,28 @@ def test_resume_rejects_changed_cadence_but_accepts_same_state():
         cadence.validate_resume({"fixed_period": 1, "schedule": "0:5,1000:50"})
     with pytest.raises(ValueError, match="cadence checkpoint configuration mismatch"):
         cadence.validate_resume({"fixed_period": 5, "schedule": ""})
+
+
+def test_full_fraction_selects_every_microbatch():
+    assert select_probe_microbatch_indices(8, 1.0, step=17) == tuple(range(8))
+
+
+def test_fraction_selects_evenly_spaced_rotating_microbatches():
+    first = select_probe_microbatch_indices(8, 0.5, step=0)
+    second = select_probe_microbatch_indices(8, 0.5, step=1)
+    assert first == (0, 2, 4, 6)
+    assert second == (1, 3, 5, 7)
+
+
+def test_fraction_rounds_but_keeps_at_least_one_microbatch():
+    assert len(select_probe_microbatch_indices(64, 0.25, step=3)) == 16
+    assert len(select_probe_microbatch_indices(3, 0.01, step=3)) == 1
+
+
+def test_fraction_validation():
+    with pytest.raises(ValueError):
+        select_probe_microbatch_indices(8, 0.0, step=0)
+    with pytest.raises(ValueError):
+        select_probe_microbatch_indices(8, 1.1, step=0)
+    with pytest.raises(ValueError):
+        select_probe_microbatch_indices(0, 0.5, step=0)

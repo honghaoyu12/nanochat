@@ -52,7 +52,7 @@ from nanochat.causal_dual_controller import (
     snapshot_optimizer_parameters,
 )
 from nanochat.dual_controller import NanochatDualActuatorController
-from nanochat.control_cadence import ControlCadence
+from nanochat.control_cadence import ControlCadence, select_probe_microbatch_indices
 from nanochat.control_governors import (
     AUTONOMOUS_COOLDOWN_VARIANTS,
     AlphaCeilingGovernor,
@@ -129,6 +129,7 @@ parser.add_argument(
     help="optional controller-relative phased probe cadence, e.g. 0:5,1000:20,2400:100",
 )
 parser.add_argument("--control-probe-scope", type=str, default="full_accum_batch", choices=["full_accum_batch", "last_microbatch"], help="tokens used for before/after probe loss")
+parser.add_argument("--control-probe-fraction", type=float, default=1.0, help="fraction of accumulation microbatches replayed for full_accum_batch probes; 1.0 preserves the full probe")
 parser.add_argument("--control-alpha-warmup-steps", type=int, default=0, help="linearly warm up applied absolute alpha over this many steps")
 parser.add_argument("--control-alpha-init", type=float, default=-1.0, help="initial alpha; -1 uses matrix_lr after batch scaling")
 parser.add_argument("--control-alpha-min", type=float, default=-1.0, help="minimum alpha; -1 uses 0.25 * alpha_init")
@@ -405,6 +406,10 @@ if args.control_alpha_replay_file:
     raise ValueError("--control-alpha-replay-file is reserved and not enabled for this launch path")
 if args.control_period_steps <= 0:
     raise ValueError("--control-period-steps must be positive")
+if not math.isfinite(args.control_probe_fraction) or not 0.0 < args.control_probe_fraction <= 1.0:
+    raise ValueError("--control-probe-fraction must be finite and in (0, 1]")
+if args.control_probe_scope != "full_accum_batch" and args.control_probe_fraction != 1.0:
+    raise ValueError("--control-probe-fraction requires --control-probe-scope=full_accum_batch")
 control_cadence = ControlCadence.from_spec(
     args.control_period_schedule,
     fixed_period=args.control_period_steps,
@@ -1041,7 +1046,7 @@ controller_csv_fields = [
     "muon_update_norm", "adamw_update_norm", "total_update_norm", "muon_grad_norm",
     "adamw_grad_norm", "total_grad_norm", "num_muon_params", "num_adamw_params",
     "num_muon_tensors", "num_adamw_tensors", "factor_applied",
-    "trust_region_expanded", "trust_good_count", "probe_scope", "probe_num_microbatches",
+    "trust_region_expanded", "trust_good_count", "probe_scope", "probe_fraction", "probe_num_microbatches", "probe_num_tokens",
     "alignment_c", "alignment_penalty_term", "alignment_allows_trust_expansion",
     "alignment_bad_step", "integral_accumulation_frozen",
     "cooldown_alpha_proposed", "cooldown_alpha_cap_target",
@@ -1399,6 +1404,11 @@ while True:
     if probe_this_step:
         probe_count += 1
     probe_batches = []
+    probe_microbatch_indices = (
+        set(select_probe_microbatch_indices(grad_accum_steps, args.control_probe_fraction, step))
+        if probe_this_step and args.control_probe_scope == "full_accum_batch"
+        else set()
+    )
     loss_before_probe_sum = 0.0
     loss_before_probe_count = 0
     control_stats = None
@@ -1408,7 +1418,7 @@ while True:
         loss = model(x, y)
         train_loss = loss.detach() # for logging
         if probe_this_step:
-            if args.control_probe_scope == "full_accum_batch":
+            if args.control_probe_scope == "full_accum_batch" and micro_step in probe_microbatch_indices:
                 probe_batches.append((x.detach().clone(), y.detach().clone()))
                 loss_before_probe_sum += float(loss.detach().item())
                 loss_before_probe_count += 1
@@ -1787,7 +1797,9 @@ while True:
             "alignment_allows_trust_expansion": int(control_stats.alignment_allows_trust_expansion),
             "alignment_bad_step": int(control_stats.alignment_bad_step),
             "probe_scope": args.control_probe_scope,
+            "probe_fraction": args.control_probe_fraction,
             "probe_num_microbatches": loss_before_probe_count,
+            "probe_num_tokens": loss_before_probe_count * args.device_batch_size * args.max_seq_len * ddp_world_size,
             "predicted_was_floored": int(control_stats.predicted_was_floored),
             "rho_was_clipped": int(control_stats.rho_was_clipped),
             "integral_accumulation_frozen": int(control_stats.integral_accumulation_frozen),
