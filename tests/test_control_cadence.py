@@ -2,7 +2,60 @@
 
 import pytest
 
-from nanochat.control_cadence import ControlCadence, select_probe_microbatch_indices
+from nanochat.control_cadence import (
+    ControlCadence,
+    ControlProbeFractionSchedule,
+    select_probe_microbatch_indices,
+)
+
+
+def test_fraction_schedule_resolves_controller_relative_phases():
+    schedule = ControlProbeFractionSchedule.from_spec(
+        "0:0.5,1200:0.25,1800:0.125", fixed_fraction=1.0
+    )
+
+    assert schedule.canonical_spec == "0:0.5,1200:0.25,1800:0.125"
+    assert schedule.active_entry(step=100, control_start_step=100) == (0, 0, 0.5)
+    assert schedule.active_entry(step=1300, control_start_step=100) == (1, 1200, 0.25)
+    assert schedule.active_entry(step=1900, control_start_step=100) == (2, 1800, 0.125)
+
+
+def test_fraction_schedule_fixed_mode_preserves_scalar_behavior():
+    schedule = ControlProbeFractionSchedule.from_spec("", fixed_fraction=0.25)
+
+    assert schedule.canonical_spec == ""
+    assert schedule.active_entry(step=37, control_start_step=5) == (0, 0, 0.25)
+    assert schedule.state_dict() == {"fixed_fraction": 0.25, "schedule": ""}
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [
+        "5:0.5",
+        "0:0.5,0:0.25",
+        "0:0",
+        "0:1.1",
+        "0:nan",
+        "0:half",
+        "0:0.5,,1200:0.25",
+    ],
+)
+def test_invalid_fraction_schedule_specs_are_rejected(spec):
+    with pytest.raises(ValueError):
+        ControlProbeFractionSchedule.from_spec(spec, fixed_fraction=1.0)
+
+
+def test_fraction_schedule_resume_rejects_changed_configuration():
+    schedule = ControlProbeFractionSchedule.from_spec(
+        "0:0.5,1800:0.125", fixed_fraction=1.0
+    )
+
+    schedule.validate_resume(schedule.state_dict())
+    schedule.validate_resume(None)
+    with pytest.raises(ValueError, match="probe fraction checkpoint configuration mismatch"):
+        schedule.validate_resume({"fixed_fraction": 1.0, "schedule": "0:0.5,1800:0.25"})
+    with pytest.raises(ValueError, match="probe fraction checkpoint configuration mismatch"):
+        schedule.validate_resume({"fixed_fraction": 0.5, "schedule": ""})
 
 
 def test_fixed_period_preserves_legacy_relative_step_behavior():

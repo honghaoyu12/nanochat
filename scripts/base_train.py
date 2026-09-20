@@ -52,7 +52,11 @@ from nanochat.causal_dual_controller import (
     snapshot_optimizer_parameters,
 )
 from nanochat.dual_controller import NanochatDualActuatorController
-from nanochat.control_cadence import ControlCadence, select_probe_microbatch_indices
+from nanochat.control_cadence import (
+    ControlCadence,
+    ControlProbeFractionSchedule,
+    select_probe_microbatch_indices,
+)
 from nanochat.control_governors import (
     AUTONOMOUS_COOLDOWN_VARIANTS,
     AlphaCeilingGovernor,
@@ -130,6 +134,7 @@ parser.add_argument(
 )
 parser.add_argument("--control-probe-scope", type=str, default="full_accum_batch", choices=["full_accum_batch", "last_microbatch"], help="tokens used for before/after probe loss")
 parser.add_argument("--control-probe-fraction", type=float, default=1.0, help="fraction of accumulation microbatches replayed for full_accum_batch probes; 1.0 preserves the full probe")
+parser.add_argument("--control-probe-fraction-schedule", type=str, default="", help="optional controller-relative phased probe fractions, e.g. 0:0.5,1200:0.25,1800:0.125")
 parser.add_argument("--control-alpha-warmup-steps", type=int, default=0, help="linearly warm up applied absolute alpha over this many steps")
 parser.add_argument("--control-alpha-init", type=float, default=-1.0, help="initial alpha; -1 uses matrix_lr after batch scaling")
 parser.add_argument("--control-alpha-min", type=float, default=-1.0, help="minimum alpha; -1 uses 0.25 * alpha_init")
@@ -408,8 +413,18 @@ if args.control_period_steps <= 0:
     raise ValueError("--control-period-steps must be positive")
 if not math.isfinite(args.control_probe_fraction) or not 0.0 < args.control_probe_fraction <= 1.0:
     raise ValueError("--control-probe-fraction must be finite and in (0, 1]")
-if args.control_probe_scope != "full_accum_batch" and args.control_probe_fraction != 1.0:
-    raise ValueError("--control-probe-fraction requires --control-probe-scope=full_accum_batch")
+if args.control_probe_fraction_schedule and args.control_probe_fraction != 1.0:
+    raise ValueError("--control-probe-fraction-schedule cannot be combined with a non-default --control-probe-fraction")
+control_probe_fraction_schedule = ControlProbeFractionSchedule.from_spec(
+    args.control_probe_fraction_schedule,
+    fixed_fraction=args.control_probe_fraction,
+)
+if args.control_probe_scope != "full_accum_batch":
+    if control_probe_fraction_schedule.entries is not None:
+        raise ValueError("--control-probe-fraction-schedule requires --control-probe-scope=full_accum_batch")
+    if control_probe_fraction_schedule.fixed_fraction != 1.0:
+        raise ValueError("fractional probes require --control-probe-scope=full_accum_batch")
+args.control_probe_fraction_schedule = control_probe_fraction_schedule.canonical_spec
 control_cadence = ControlCadence.from_spec(
     args.control_period_schedule,
     fixed_period=args.control_period_steps,
@@ -419,6 +434,8 @@ print0(
     f"Controller cadence: "
     f"{control_cadence.canonical_spec or f'fixed:{control_cadence.fixed_period}'}"
 )
+if control_probe_fraction_schedule.canonical_spec:
+    print0(f"Controller probe fractions: {control_probe_fraction_schedule.canonical_spec}")
 if args.control_log_every <= 0:
     raise ValueError("--control-log-every must be positive")
 if args.local_log_every <= 0:
@@ -950,6 +967,15 @@ if controlled_muon_enabled:
             meta_data.get("control_cadence")
             or meta_data.get("user_config", {}).get("control_cadence")
         )
+        saved_probe_fraction_state = meta_data.get("control_probe_fraction_schedule")
+        if saved_probe_fraction_state is None:
+            saved_user_config = meta_data.get("user_config", {})
+            if "control_probe_fraction" in saved_user_config:
+                saved_probe_fraction_state = {
+                    "fixed_fraction": saved_user_config["control_probe_fraction"],
+                    "schedule": saved_user_config.get("control_probe_fraction_schedule", ""),
+                }
+        control_probe_fraction_schedule.validate_resume(saved_probe_fraction_state)
 
 metrics_output_dir = args.local_output_dir
 if controlled_muon_enabled and not metrics_output_dir:
@@ -990,6 +1016,7 @@ if local_metrics_enabled and master_process:
         "control_rho_reference": args.control_rho_reference,
         "rho_reference": None if rho_reference is None else rho_reference.state_dict(),
         "control_cadence": control_cadence.state_dict(),
+        "control_probe_fraction_schedule": control_probe_fraction_schedule.state_dict(),
     }
     with open(metadata_path, "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2)
@@ -1046,7 +1073,9 @@ controller_csv_fields = [
     "muon_update_norm", "adamw_update_norm", "total_update_norm", "muon_grad_norm",
     "adamw_grad_norm", "total_grad_norm", "num_muon_params", "num_adamw_params",
     "num_muon_tensors", "num_adamw_tensors", "factor_applied",
-    "trust_region_expanded", "trust_good_count", "probe_scope", "probe_fraction", "probe_num_microbatches", "probe_num_tokens",
+    "trust_region_expanded", "trust_good_count", "probe_scope", "probe_fraction",
+    "probe_fraction_schedule", "probe_fraction_phase_index", "probe_fraction_phase_start",
+    "probe_num_microbatches", "probe_num_tokens",
     "alignment_c", "alignment_penalty_term", "alignment_allows_trust_expansion",
     "alignment_bad_step", "integral_accumulation_frozen",
     "cooldown_alpha_proposed", "cooldown_alpha_cap_target",
@@ -1058,6 +1087,8 @@ controller_csv_fields = [
 train_csv_fields = [
     "step", "tokens", "train_loss", "smooth_train_loss", "lrm", "dt_seconds",
     "control_period_steps", "control_period_schedule", "probe_this_step", "probe_count",
+    "probe_fraction", "probe_fraction_schedule", "probe_fraction_phase_index",
+    "probe_fraction_phase_start", "probe_num_microbatches", "probe_num_tokens",
     "muon_multiplier", "adamw_multiplier",
     "tok_per_sec", "mfu", "total_training_time_seconds", "alpha",
     "native_muon_lr_min", "native_muon_lr_max", "muon_lr_min", "muon_lr_max",
@@ -1369,6 +1400,7 @@ while True:
                 "max_seq_len": args.max_seq_len,
                 "total_batch_size": total_batch_size,
                 "control_cadence": control_cadence.state_dict(),
+                "control_probe_fraction_schedule": control_probe_fraction_schedule.state_dict(),
                 "dataloader_state_dict": dataloader_state_dict,
                 "loop_state": { # all loop state (other than step) so that we can resume training
                     "min_val_bpb": min_val_bpb,
@@ -1397,6 +1429,14 @@ while True:
         step=step,
         control_start_step=args.control_start_step,
     )
+    (
+        active_probe_fraction_phase_index,
+        active_probe_fraction_phase_start,
+        active_probe_fraction,
+    ) = control_probe_fraction_schedule.active_entry(
+        step=step,
+        control_start_step=args.control_start_step,
+    )
     probe_this_step = control_active and control_cadence.is_probe_step(
         step=step,
         control_start_step=args.control_start_step,
@@ -1405,7 +1445,7 @@ while True:
         probe_count += 1
     probe_batches = []
     probe_microbatch_indices = (
-        set(select_probe_microbatch_indices(grad_accum_steps, args.control_probe_fraction, step))
+        set(select_probe_microbatch_indices(grad_accum_steps, active_probe_fraction, step))
         if probe_this_step and args.control_probe_scope == "full_accum_batch"
         else set()
     )
@@ -1797,7 +1837,10 @@ while True:
             "alignment_allows_trust_expansion": int(control_stats.alignment_allows_trust_expansion),
             "alignment_bad_step": int(control_stats.alignment_bad_step),
             "probe_scope": args.control_probe_scope,
-            "probe_fraction": args.control_probe_fraction,
+            "probe_fraction": active_probe_fraction,
+            "probe_fraction_schedule": control_probe_fraction_schedule.canonical_spec,
+            "probe_fraction_phase_index": active_probe_fraction_phase_index,
+            "probe_fraction_phase_start": active_probe_fraction_phase_start,
             "probe_num_microbatches": loss_before_probe_count,
             "probe_num_tokens": loss_before_probe_count * args.device_batch_size * args.max_seq_len * ddp_world_size,
             "predicted_was_floored": int(control_stats.predicted_was_floored),
@@ -1838,6 +1881,12 @@ while True:
             "control_period_schedule": control_cadence.canonical_spec,
             "probe_this_step": int(probe_this_step),
             "probe_count": probe_count,
+            "probe_fraction": active_probe_fraction,
+            "probe_fraction_schedule": control_probe_fraction_schedule.canonical_spec,
+            "probe_fraction_phase_index": active_probe_fraction_phase_index,
+            "probe_fraction_phase_start": active_probe_fraction_phase_start,
+            "probe_num_microbatches": loss_before_probe_count,
+            "probe_num_tokens": loss_before_probe_count * args.device_batch_size * args.max_seq_len * ddp_world_size,
             "tok_per_sec": tok_per_sec,
             "mfu": mfu,
             "total_training_time_seconds": total_training_time,
