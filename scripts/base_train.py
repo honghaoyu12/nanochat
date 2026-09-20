@@ -110,6 +110,7 @@ parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate
 parser.add_argument("--scalar-lr", type=float, default=0.5, help="learning rate for scalars (resid_lambdas, x0_lambdas)")
 parser.add_argument("--warmup-steps", type=int, default=40, help="number of steps for LR warmup")
 parser.add_argument("--warmdown-ratio", type=float, default=0.65, help="ratio of iterations for LR warmdown")
+parser.add_argument("--warmdown-power", type=float, default=1.0, help="power-law exponent for WSD warmdown; 1.0 preserves linear warmdown")
 parser.add_argument("--final-lr-frac", type=float, default=0.05, help="final LR as fraction of initial LR")
 parser.add_argument("--resume-from-step", type=int, default=-1, help="resume training from this step (-1 = disable)")
 # Controlled Muon research baseline
@@ -268,6 +269,8 @@ if args.controlled_muon and args.optimizer_variant not in CONTROLLED_MUON_VARIAN
 control_rho_middle = args.control_rho_star if args.control_rho_middle is None else args.control_rho_middle
 control_rho_cruise = control_rho_middle if args.control_rho_cruise is None else args.control_rho_cruise
 control_rho_late = args.control_rho_late
+if not math.isfinite(args.warmdown_power) or args.warmdown_power <= 0.0:
+    raise ValueError("--warmdown-power must be finite and > 0")
 if args.control_rho_reference in {"loss_progress", "loss_progress_three_stage"}:
     if args.optimizer_variant not in {"controlled_muon_raw", "controlled_muon_ema", "controlled_muon_ema_trust"}:
         raise ValueError("loss_progress rho reference is currently supported only for P controlled_muon variants")
@@ -1196,7 +1199,7 @@ def get_lr_multiplier(it):
         return 1.0
     else:
         progress = (num_iterations - it) / warmdown_iters
-        return progress * 1.0 + (1 - progress) * args.final_lr_frac
+        return args.final_lr_frac + (1 - args.final_lr_frac) * progress ** args.warmdown_power
 
 # Momentum scheduler for Muon optimizer (warms up to 0.97, warms down to 0.90 during LR warmdown)
 def get_muon_momentum(it):
