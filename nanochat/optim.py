@@ -9,6 +9,7 @@ Adapted from: https://github.com/KellerJordan/modded-nanogpt
 Further contributions from @karpathy and @chrisjmccormick.
 """
 
+import os
 import torch
 import torch.distributed as dist
 from torch import Tensor
@@ -109,6 +110,9 @@ polar_express_coeffs = [
 
 KELLER_MUON_REFERENCE_COMMIT = "f98f1cacc0263b04290753e32be8d498c1efc806"
 KELLER_NS_COEFFICIENTS = (3.4445, -4.7750, 2.0315)
+# Transfer benchmarks may opt into fp32 optimizer state and polar arithmetic.
+# The default preserves Nanochat's established bf16 Muon behavior.
+USE_FP32_MUON_STATE = os.environ.get("NANOCHAT_MUON_FP32_STATE", "0") == "1"
 
 
 @torch.compile(dynamic=False, fullgraph=True)
@@ -131,12 +135,17 @@ def muon_step_fused(
     """
 
     # Nesterov momentum
-    momentum = momentum_t.to(stacked_grads.dtype)
-    momentum_buffer.lerp_(stacked_grads, 1 - momentum)
-    g = stacked_grads.lerp_(momentum_buffer, momentum)
+    if USE_FP32_MUON_STATE:
+        momentum = momentum_t.to(torch.float32)
+        momentum_buffer.lerp_(stacked_grads.float(), 1 - momentum)
+        g = stacked_grads.float().lerp(momentum_buffer, momentum)
+    else:
+        momentum = momentum_t.to(stacked_grads.dtype)
+        momentum_buffer.lerp_(stacked_grads, 1 - momentum)
+        g = stacked_grads.lerp_(momentum_buffer, momentum)
 
     # Cast to bf16 for speed when available; skip cast otherwise (fp16 is unstable here due to limited exponent range)
-    X = g.bfloat16() if COMPUTE_DTYPE == torch.bfloat16 else g
+    X = g if USE_FP32_MUON_STATE else (g.bfloat16() if COMPUTE_DTYPE == torch.bfloat16 else g)
 
     # MuonEq row equilibration: rescale each row to the mean row norm so the spectrum entering orthogonalization is better conditioned
     target = X.float().norm(dim=(-2, -1), keepdim=True) / (X.size(-2) ** 0.5)
@@ -156,7 +165,7 @@ def muon_step_fused(
             B = b * A + c * (A @ A)
             X = a * X + B @ X
     # Cast back to the param dtype (MPS errors on the mixed-dtype ops below when X is bf16)
-    g = X.to(stacked_params.dtype)
+    g = X if USE_FP32_MUON_STATE else X.to(stacked_params.dtype)
 
     # Muon+ renormalization: snap Frobenius norm to sqrt(min(m, n))
     target_norm = min(g.size(-2), g.size(-1)) ** 0.5
@@ -319,6 +328,53 @@ class MuonAdamW(torch.optim.Optimizer):
         self._control_diagnostics_enabled = False
         self._control_diagnostics_include_adamw = True
         self._control_diagnostics = self._empty_control_diagnostics()
+
+    def load_state_dict(self, state_dict):
+        """Restore optimizer state without losing the optional FP32 Muon buffers.
+
+        ``torch.optim.Optimizer.load_state_dict`` casts floating state tensors
+        to the corresponding parameter dtype.  Transfer runs deliberately keep
+        enhanced-Muon momentum and factored variance in FP32, so restore those
+        two state entries after the base loader has materialized them.
+        The default Nanochat path remains unchanged when the opt-in flag is off.
+        """
+        saved_muon_state = {}
+        if USE_FP32_MUON_STATE and self.muon_backend == "nanochat_enhanced":
+            # Keep the serialized FP32 tensors aside.  The generic optimizer
+            # loader casts floating state to parameter dtype before returning.
+            for saved_group in state_dict.get("param_groups", []):
+                for saved_id, saved_param_state in zip(
+                    saved_group.get("params", []),
+                    (state_dict.get("state", {}).get(pid, {}) for pid in saved_group.get("params", [])),
+                ):
+                    if not isinstance(saved_param_state, dict):
+                        continue
+                    keep = {
+                        name: value.detach().clone()
+                        for name, value in saved_param_state.items()
+                        if name in ("momentum_buffer", "second_momentum_buffer")
+                        and torch.is_tensor(value)
+                        and value.dtype == torch.float32
+                    }
+                    if keep:
+                        saved_muon_state[saved_id] = keep
+        super().load_state_dict(state_dict)
+        if not (USE_FP32_MUON_STATE and self.muon_backend == "nanochat_enhanced"):
+            return
+        for saved_group, current_group in zip(
+            state_dict.get("param_groups", []), self.param_groups
+        ):
+            if current_group.get("kind") != "muon":
+                continue
+            for saved_id, parameter in zip(saved_group.get("params", []), current_group["params"]):
+                saved = saved_muon_state.get(saved_id)
+                if not saved:
+                    continue
+                state = self.state.get(parameter)
+                if state is None:
+                    continue
+                for name, value in saved.items():
+                    state[name] = value.to(device=parameter.device, dtype=torch.float32)
 
     @staticmethod
     def _empty_control_diagnostics() -> dict:
@@ -505,11 +561,12 @@ class MuonAdamW(torch.optim.Optimizer):
 
         # Get or create group-level state
         state = self.state[p]
+        state_dtype = torch.float32 if USE_FP32_MUON_STATE and self.muon_backend == "nanochat_enhanced" else dtype
         if "momentum_buffer" not in state:
-            state["momentum_buffer"] = torch.zeros(chunk_size, *shape, dtype=dtype, device=device)
+            state["momentum_buffer"] = torch.zeros(chunk_size, *shape, dtype=state_dtype, device=device)
         if self.muon_backend == "nanochat_enhanced" and "second_momentum_buffer" not in state:
             state_shape = (chunk_size, shape[-2], 1) if shape[-2] >= shape[-1] else (chunk_size, 1, shape[-1])
-            state["second_momentum_buffer"] = torch.zeros(state_shape, dtype=dtype, device=device)
+            state["second_momentum_buffer"] = torch.zeros(state_shape, dtype=state_dtype, device=device)
         red_dim = -1 if shape[-2] >= shape[-1] else -2
 
         stacked_owned = None
