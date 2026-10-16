@@ -143,6 +143,7 @@ parser.add_argument("--control-alpha-replay-file", type=str, default="", help="r
 parser.add_argument("--control-residual-validity-gate", action="store_true", help="reject low-observability Muon residual probes before rho EMA")
 parser.add_argument("--control-causal-rho-beta", type=float, default=0.9, help="EMA beta for causal Muon/AdamW response ratios")
 parser.add_argument("--control-causal-interaction-max-ratio", type=float, default=1.0, help="maximum interaction residual ratio that permits causal allocation updates")
+parser.add_argument("--control-causal-attribution-period", type=int, default=1, help="run the expensive causal Muon/AdamW replay every Nth total probe; 1 preserves exact attribution on every probe")
 parser.add_argument("--control-residual-min-muon-predicted-fraction", type=float, default=0.10, help="minimum predicted Muon fraction for residual feedback validity")
 parser.add_argument("--control-residual-max-adamw-predicted-fraction", type=float, default=0.90, help="maximum predicted AdamW fraction for residual feedback validity")
 parser.add_argument("--control-startup-alpha-reference-ratio", type=float, default=1.0, help="opt-in autonomous startup alpha target as a multiple of alpha init; 1 disables")
@@ -430,6 +431,8 @@ control_cadence = ControlCadence.from_spec(
     fixed_period=args.control_period_steps,
 )
 args.control_period_schedule = control_cadence.canonical_spec
+if args.control_causal_attribution_period <= 0:
+    raise ValueError("--control-causal-attribution-period must be positive")
 print0(
     f"Controller cadence: "
     f"{control_cadence.canonical_spec or f'fixed:{control_cadence.fixed_period}'}"
@@ -1038,6 +1041,8 @@ controller_csv_fields = [
     "causal_rho_muon", "causal_rho_adamw", "causal_rho_muon_ema",
     "causal_rho_adamw_ema", "causal_interaction_residual",
     "causal_interaction_ratio", "causal_component_valid", "causal_invalid_reason",
+    "causal_attribution_period", "causal_attribution_exact", "causal_attribution_age",
+    "causal_exact_attribution_count", "causal_total_only_count",
     "causal_allocation_update_frozen", "causal_allocation_deadband_active",
     "causal_allocation_log_scale", "causal_allocation_error",
     "native_lrm", "native_muon_lr_min", "native_muon_lr_max", "muon_lr_min",
@@ -1443,6 +1448,11 @@ while True:
     )
     if probe_this_step:
         probe_count += 1
+    causal_attribution_this_probe = (
+        causal_dual_control_enabled
+        and probe_this_step
+        and (probe_count - 1) % args.control_causal_attribution_period == 0
+    )
     probe_batches = []
     probe_microbatch_indices = (
         set(select_probe_microbatch_indices(grad_accum_steps, active_probe_fraction, step))
@@ -1539,7 +1549,11 @@ while True:
     if probe_this_step:
         optimizer.set_control_diagnostics(True, include_adamw=True)
     step_skipped_by_scaler = False
-    pre_update_parameters = snapshot_optimizer_parameters(optimizer) if probe_this_step and causal_dual_control_enabled else None
+    pre_update_parameters = (
+        snapshot_optimizer_parameters(optimizer)
+        if causal_attribution_this_probe
+        else None
+    )
     if scaler is not None:
         scaler.unscale_(optimizer)
         # In distributed training, all ranks must agree on whether to skip the step.
@@ -1560,22 +1574,30 @@ while True:
             loss_before_probe = loss_before_probe_sum / max(1, loss_before_probe_count)
             causal_probe_result = None
             if causal_dual_control_enabled:
-                if pre_update_parameters is None:
-                    raise RuntimeError("causal probe is missing pre-update parameters")
-                causal_probe_result = evaluate_causal_component_probe(
-                    model=model,
-                    optimizer=optimizer,
-                    probe_batches=probe_batches,
-                    pre_update_parameters=pre_update_parameters,
-                )
-                causal_probe_result = causal_probe_result.__class__(
-                    loss_pre=_all_reduce_mean_scalar(causal_probe_result.loss_pre, device),
-                    loss_total=_all_reduce_mean_scalar(causal_probe_result.loss_total, device),
-                    loss_muon=_all_reduce_mean_scalar(causal_probe_result.loss_muon, device),
-                    loss_adamw=_all_reduce_mean_scalar(causal_probe_result.loss_adamw, device),
-                )
-                loss_before_probe = causal_probe_result.loss_pre
-                loss_after_probe = causal_probe_result.loss_total
+                if causal_attribution_this_probe:
+                    if pre_update_parameters is None:
+                        raise RuntimeError("causal probe is missing pre-update parameters")
+                    causal_probe_result = evaluate_causal_component_probe(
+                        model=model,
+                        optimizer=optimizer,
+                        probe_batches=probe_batches,
+                        pre_update_parameters=pre_update_parameters,
+                    )
+                    causal_probe_result = causal_probe_result.__class__(
+                        loss_pre=_all_reduce_mean_scalar(causal_probe_result.loss_pre, device),
+                        loss_total=_all_reduce_mean_scalar(causal_probe_result.loss_total, device),
+                        loss_muon=_all_reduce_mean_scalar(causal_probe_result.loss_muon, device),
+                        loss_adamw=_all_reduce_mean_scalar(causal_probe_result.loss_adamw, device),
+                    )
+                    loss_before_probe = causal_probe_result.loss_pre
+                    loss_after_probe = causal_probe_result.loss_total
+                else:
+                    # A sparse-attribution event still uses the current total
+                    # probe for global control, but skips all counterfactual
+                    # parameter replays.
+                    loss_before_probe = _all_reduce_mean_scalar(loss_before_probe, device)
+                    loss_after_probe = _average_probe_loss(model, probe_batches)
+                    loss_after_probe = _all_reduce_mean_scalar(loss_after_probe, device)
             else:
                 loss_after_probe = _average_probe_loss(model, probe_batches)
                 loss_before_probe = _all_reduce_mean_scalar(loss_before_probe, device)
@@ -1661,17 +1683,27 @@ while True:
                     adamw_update_norm=control_diagnostics["adamw_update_norm"],
                 )
             elif causal_dual_control_enabled:
-                if causal_probe_result is None:
-                    raise RuntimeError("causal controller is missing causal probe results")
-                controller_update_kwargs.update(
-                    actual_decrease_muon=causal_probe_result.actual_decrease_muon,
-                    actual_decrease_adamw=causal_probe_result.actual_decrease_adamw,
-                    actual_decrease_total=causal_probe_result.actual_decrease_total,
-                    interaction_residual=causal_probe_result.interaction_residual,
-                    predicted_decrease_muon=control_diagnostics["predicted_decrease_muon"],
-                    predicted_decrease_adamw=control_diagnostics["predicted_decrease_adamw"],
-                )
-            control_stats = controller.update(**controller_update_kwargs)
+                if causal_attribution_this_probe:
+                    if causal_probe_result is None:
+                        raise RuntimeError("causal controller is missing causal probe results")
+                    controller_update_kwargs.update(
+                        actual_decrease_muon=causal_probe_result.actual_decrease_muon,
+                        actual_decrease_adamw=causal_probe_result.actual_decrease_adamw,
+                        actual_decrease_total=causal_probe_result.actual_decrease_total,
+                        interaction_residual=causal_probe_result.interaction_residual,
+                        predicted_decrease_muon=control_diagnostics["predicted_decrease_muon"],
+                        predicted_decrease_adamw=control_diagnostics["predicted_decrease_adamw"],
+                    )
+                    control_stats = controller.update(**controller_update_kwargs)
+                else:
+                    controller_update_kwargs.update(
+                        actual_decrease_total=actual_total,
+                        predicted_decrease_muon=control_diagnostics["predicted_decrease_muon"],
+                        predicted_decrease_adamw=control_diagnostics["predicted_decrease_adamw"],
+                    )
+                    control_stats = controller.update_total_only(**controller_update_kwargs)
+            else:
+                control_stats = controller.update(**controller_update_kwargs)
     model.zero_grad(set_to_none=True)
     if rho_reference is None:
         train_loss_f = train_loss.item()
@@ -1735,6 +1767,11 @@ while True:
             "causal_interaction_ratio": causal_stats.get("causal_interaction_ratio", ""),
             "causal_component_valid": int(causal_stats["causal_component_valid"]) if causal_stats else "",
             "causal_invalid_reason": causal_stats.get("causal_invalid_reason", ""),
+            "causal_attribution_period": args.control_causal_attribution_period if causal_dual_control_enabled else "",
+            "causal_attribution_exact": int(causal_stats["causal_attribution_exact"]) if causal_stats else "",
+            "causal_attribution_age": causal_stats.get("causal_attribution_age", ""),
+            "causal_exact_attribution_count": causal_stats.get("causal_exact_attribution_count", ""),
+            "causal_total_only_count": causal_stats.get("causal_total_only_count", ""),
             "causal_allocation_update_frozen": int(causal_stats["allocation_update_frozen"]) if causal_stats else "",
             "causal_allocation_deadband_active": int(causal_stats["allocation_deadband_active"]) if causal_stats else "",
             "causal_allocation_log_scale": causal_stats.get("allocation_log_scale", ""),

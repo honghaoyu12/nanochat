@@ -239,6 +239,9 @@ class NanochatCausalDualActuatorController:
         self._adamw_weight = 0.5
         self._muon_multiplier = float(global_controller.alpha)
         self._adamw_multiplier = float(global_controller.alpha)
+        self._attribution_age = 0
+        self._exact_attribution_count = 0
+        self._total_only_count = 0
         self.last_causal_stats: dict[str, Any] = self._empty_stats()
 
     @property
@@ -291,6 +294,10 @@ class NanochatCausalDualActuatorController:
             "allocation_error": 0.0,
             "muon_bound_hit": False,
             "adamw_bound_hit": False,
+            "causal_attribution_exact": False,
+            "causal_attribution_age": 0,
+            "causal_exact_attribution_count": 0,
+            "causal_total_only_count": 0,
         }
 
     def _recompute_multipliers(self) -> None:
@@ -379,6 +386,8 @@ class NanochatCausalDualActuatorController:
                     self.allocation_log_max,
                 )
         self._recompute_multipliers()
+        self._attribution_age = 0
+        self._exact_attribution_count += 1
         self.last_causal_stats = {
             "global_multiplier": self.global_controller.alpha,
             "muon_multiplier": self._muon_multiplier,
@@ -404,7 +413,51 @@ class NanochatCausalDualActuatorController:
             "muon_bound_hit": self._muon_multiplier in (self.multiplier_min, self.multiplier_max),
             "adamw_bound_hit": self._adamw_multiplier in (self.multiplier_min, self.multiplier_max),
             "feedback_invalid_reason": feedback_invalid_reason,
+            "causal_attribution_exact": True,
+            "causal_attribution_age": self._attribution_age,
+            "causal_exact_attribution_count": self._exact_attribution_count,
+            "causal_total_only_count": self._total_only_count,
         }
+        return stats
+
+    def update_total_only(
+        self,
+        *,
+        actual_decrease_total: float,
+        predicted_decrease_muon: float,
+        predicted_decrease_adamw: float,
+        **global_kwargs: Any,
+    ):
+        """Update global control from a total probe without causal replays.
+
+        This path intentionally leaves the Muon/AdamW allocation and the last
+        exact component attribution unchanged. It still feeds the current
+        total-loss observation to the global controller.
+        """
+        predicted_total = float(predicted_decrease_muon) + float(predicted_decrease_adamw)
+        global_kwargs.pop("predicted_decrease", None)
+        global_kwargs.pop("feedback_actual_decrease", None)
+        stats = self.global_controller.update(
+            predicted_decrease=predicted_total,
+            feedback_actual_decrease=float(actual_decrease_total),
+            **global_kwargs,
+        )
+        self._total_only_count += 1
+        self._attribution_age += 1
+        self._recompute_multipliers()
+        stale = dict(self.last_causal_stats)
+        stale.update({
+            "global_multiplier": self.global_controller.alpha,
+            "muon_multiplier": self._muon_multiplier,
+            "adamw_multiplier": self._adamw_multiplier,
+            "allocation_update_frozen": True,
+            "causal_attribution_exact": False,
+            "causal_attribution_age": self._attribution_age,
+            "causal_exact_attribution_count": self._exact_attribution_count,
+            "causal_total_only_count": self._total_only_count,
+            "causal_invalid_reason": "attribution_stale",
+        })
+        self.last_causal_stats = stale
         return stats
 
     def state_dict(self) -> dict[str, Any]:
@@ -430,6 +483,9 @@ class NanochatCausalDualActuatorController:
             "muon_multiplier": self._muon_multiplier,
             "adamw_multiplier": self._adamw_multiplier,
             "last_causal_stats": self.last_causal_stats,
+            "attribution_age": self._attribution_age,
+            "exact_attribution_count": self._exact_attribution_count,
+            "total_only_count": self._total_only_count,
         }
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
@@ -458,5 +514,8 @@ class NanochatCausalDualActuatorController:
         self._muon_weight = float(state.get("muon_weight", 0.5))
         self._adamw_weight = float(state.get("adamw_weight", 0.5))
         self.rho_adamw_ema = state.get("rho_adamw_ema")
+        self._attribution_age = int(state.get("attribution_age", 0))
+        self._exact_attribution_count = int(state.get("exact_attribution_count", 0))
+        self._total_only_count = int(state.get("total_only_count", 0))
         self._recompute_multipliers()
         self.last_causal_stats = dict(state.get("last_causal_stats", self._empty_stats()))
